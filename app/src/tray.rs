@@ -3,7 +3,10 @@
 //! Closing the launcher keeps the program in the tray (as remote-control
 //! tools do; setting `close_to_tray`): left click or "打开" shows it again,
 //! "退出" ends every session and quits. Starting the program again while it
-//! runs only brings the running one to the front.
+//! runs only brings the running one to the front (with a clicked pairing
+//! link: hands it the link, through a file next to the settings).
+
+use std::path::{Path, PathBuf};
 
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -70,34 +73,54 @@ pub struct Instance {
     show: HANDLE,
 }
 
+/// Where a second start leaves its pairing link for the running program.
+fn link_file(dir: &Path) -> PathBuf {
+    dir.join("open-link.txt")
+}
+
 /// `Some` if this is the only instance; otherwise the running one was asked
-/// to show itself and this one should quit.
-pub fn claim() -> Option<Instance> {
+/// to show itself (and open `link`) and this one should quit.
+pub fn claim(dir: &Path, link: Option<&str>) -> Option<Instance> {
     // SAFETY: named kernel objects of this user session; the handles live as
     // long as the process (the mutex marks it as running).
     unsafe {
         let _mutex = CreateMutexW(None, true, w!("Local\\NyaRemoteControl.App"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            if let Some(l) = link {
+                if let Err(e) = std::fs::write(link_file(dir), l) {
+                    tracing::warn!("hand over the link: {e}");
+                }
+            }
             if let Ok(ev) = OpenEventW(EVENT_MODIFY_STATE, false, w!("Local\\NyaRemoteControl.Show")) {
                 let _ = SetEvent(ev);
             }
             return None;
         }
+        // Left over from a start the previous program never read.
+        let _ = std::fs::remove_file(link_file(dir));
         let show = CreateEventW(None, false, false, w!("Local\\NyaRemoteControl.Show")).ok()?;
         Some(Instance { show })
     }
 }
 
 impl Instance {
-    /// Another start of the program shows this one (`UiEvent::Tray(Open)`).
-    pub fn listen(self, ui: Ui) {
+    /// Another start of the program shows this one (`UiEvent::Tray(Open)`),
+    /// or opens the pairing link it was started with (`UiEvent::OpenLink`).
+    pub fn listen(self, ui: Ui, dir: PathBuf) {
         let show = self.show.0 as isize; // a handle, valid in every thread
         std::thread::Builder::new()
             .name("single instance".into())
             .spawn(move || loop {
                 // SAFETY: our own event handle, never closed.
                 unsafe { WaitForSingleObject(HANDLE(show as *mut _), INFINITE) };
-                ui.send(UiEvent::Tray(TrayAction::Open));
+                let file = link_file(&dir);
+                match std::fs::read_to_string(&file) {
+                    Ok(link) => {
+                        let _ = std::fs::remove_file(&file);
+                        ui.send(UiEvent::OpenLink(link));
+                    }
+                    Err(_) => ui.send(UiEvent::Tray(TrayAction::Open)),
+                }
             })
             .ok();
     }

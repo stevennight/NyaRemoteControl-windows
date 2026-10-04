@@ -60,12 +60,16 @@ pub struct ConnectDone {
     pub result: Result<Box<Link>, String>,
     /// The failure was a changed server certificate.
     pub pin_mismatch: bool,
+    /// A pairing link: the address that answered.
+    pub address: Option<String>,
 }
 
 /// Events delivered to the winit event loop.
 pub enum UiEvent {
     /// The tray icon (or another start of the program) asks for something.
     Tray(crate::tray::TrayAction),
+    /// A `nyaremote://` link was opened (this start of the program, or another one).
+    OpenLink(String),
     Connected,
     SessionInfo(pb::SessionInfo),
     /// Who operates the host (several clients connected).

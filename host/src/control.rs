@@ -96,6 +96,11 @@ async fn handle(mut pipe: NamedPipeServer, state: &Arc<State>) -> Result<()> {
     Ok(())
 }
 
+/// The full certificate fingerprint (pairing links pin it).
+fn full_fp() -> String {
+    crate::net::SERVER_FP.get().map(|f| f.to_hex()).unwrap_or_default()
+}
+
 fn err(code: Code, message: impl Into<String>) -> Resp {
     Resp::Error(cpb::Error { code: code as i32, message: message.into() })
 }
@@ -119,13 +124,13 @@ fn dispatch(state: &State, admin: bool, req: Option<Req>) -> Resp {
         Req::GetStatus(_) => Resp::Status(state.status(admin)),
         _ if !admin => err(Code::Denied, "需要管理员权限"),
         Req::GetPairing(_) => {
-            Resp::Pairing(cpb::Pairing { code: state.auth.key().to_code(), fingerprint: state.fingerprint.clone() })
+            Resp::Pairing(cpb::Pairing { code: state.auth.key().to_code(), fingerprint: state.fingerprint.clone(), fingerprint_hex: full_fp() })
         }
         Req::ResetPairingCode(_) => match state.auth.reset_key() {
             Ok(k) => {
                 tracing::info!("pairing code reset from the control pipe");
                 state.event(cpb::event::Kind::Service, "配对码已重新生成");
-                Resp::Pairing(cpb::Pairing { code: k.to_code(), fingerprint: state.fingerprint.clone() })
+                Resp::Pairing(cpb::Pairing { code: k.to_code(), fingerprint: state.fingerprint.clone(), fingerprint_hex: full_fp() })
             }
             Err(e) => err(Code::Internal, format!("{e:#}")),
         },

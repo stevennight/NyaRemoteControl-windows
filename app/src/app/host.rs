@@ -291,6 +291,8 @@ struct Model {
     points_here: Option<bool>,
     code: String,
     fingerprint: String,
+    /// Full fingerprint (pairing links); empty from older services.
+    fingerprint_hex: String,
     cfg: ServerConfig,
     clients: Vec<nya_server_core::auth::PairedClient>,
     load_error: Option<String>,
@@ -310,6 +312,7 @@ impl Model {
             points_here: None,
             code: String::new(),
             fingerprint: String::new(),
+            fingerprint_hex: String::new(),
             cfg: ServerConfig::default(),
             clients: Vec::new(),
             load_error: None,
@@ -352,6 +355,7 @@ impl Model {
             Ok(p) => {
                 self.code = p.code;
                 self.fingerprint = p.fingerprint;
+                self.fingerprint_hex = p.fingerprint_hex;
             }
             Err(e) => self.load_error = Some(format!("读取配对码失败：{e:#}")),
         }
@@ -400,6 +404,7 @@ impl Model {
             "status": self.status.as_ref().map(status_json),
             "code": self.code,
             "fingerprint": self.fingerprint,
+            "invite": self.invite(),
             "config": self.cfg,
             "encoders": ENCODERS,
             "clients": self.clients,
@@ -407,6 +412,21 @@ impl Model {
             "busy": self.busy,
             "log_dir": self.dir.join("logs"),
         })
+    }
+
+    /// The pairing link and its QR code (with the code: administrators only).
+    fn invite(&self) -> Value {
+        if self.code.is_empty() || self.svc == SvcState::NotInstalled {
+            return Value::Null;
+        }
+        let invite = nya_transport::invite::Invite {
+            name: self.cfg.display_name(),
+            addresses: invite::addresses(&self.cfg),
+            fingerprint: nya_transport::Fingerprint::from_hex(&self.fingerprint_hex),
+            code: self.code.clone(),
+        };
+        let link = invite.to_link();
+        json!({ "link": link, "qr": invite::qr_svg(&link), "addresses": invite.addresses })
     }
 
     fn install_json(&self) -> Value {
@@ -678,4 +698,100 @@ fn start_install(list: Vec<(components::Id, &'static str)>, ui: Ui) -> Arc<Mutex
         notify();
     });
     job
+}
+
+/// What goes into this computer's pairing link.
+mod invite {
+    use std::net::{IpAddr, SocketAddr};
+
+    use nya_server_core::config::ServerConfig;
+
+    /// Longest address list in a link (the QR code grows with it).
+    const MAX: usize = 6;
+
+    /// The user's external addresses first (port forwarding, frp), then this
+    /// computer's own IPv4 addresses (LAN, overlay networks) at the service port.
+    pub fn addresses(cfg: &ServerConfig) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for a in cfg.public_address.split([',', '，', ';', ' ']).map(str::trim).filter(|a| !a.is_empty()) {
+            out.push(with_port(a, cfg.port));
+        }
+        let ips = match cfg.bind.parse::<IpAddr>() {
+            Ok(ip) if !ip.is_unspecified() => vec![ip],
+            _ => local_ips(),
+        };
+        out.extend(ips.into_iter().map(|ip| SocketAddr::new(ip, cfg.port).to_string()));
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|a| seen.insert(a.to_ascii_lowercase()));
+        out.truncate(MAX);
+        out
+    }
+
+    /// `host` → `host:port`; addresses with a port stay as they are.
+    pub(super) fn with_port(a: &str, port: u16) -> String {
+        if a.parse::<SocketAddr>().is_ok() {
+            return a.to_owned();
+        }
+        if let Ok(ip) = a.trim_matches(['[', ']']).parse::<IpAddr>() {
+            return SocketAddr::new(ip, port).to_string();
+        }
+        match a.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() && p.parse::<u16>().is_ok() => a.to_owned(),
+            _ => format!("{a}:{port}"),
+        }
+    }
+
+    /// IPv4 addresses of the network adapters, likely ones first (virtual
+    /// machine and WSL switches last); no loopback or self-assigned addresses.
+    fn local_ips() -> Vec<IpAddr> {
+        let Ok(ifs) = if_addrs::get_if_addrs() else { return Vec::new() };
+        let mut v: Vec<(bool, IpAddr)> = ifs
+            .into_iter()
+            .filter(|i| match i.ip() {
+                IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+                IpAddr::V6(_) => false,
+            })
+            .map(|i| {
+                let n = i.name.to_ascii_lowercase();
+                let virt = ["vethernet", "vmware", "virtualbox", "hyper-v", "wsl", "docker", "loopback"].iter().any(|k| n.contains(k));
+                (virt, i.ip())
+            })
+            .collect();
+        v.sort_by_key(|(virt, _)| *virt);
+        v.into_iter().map(|(_, ip)| ip).collect()
+    }
+
+    /// The link as a QR code (SVG, black on white: scanners want the contrast).
+    pub fn qr_svg(link: &str) -> Option<String> {
+        use qrcode::render::svg;
+        let code = qrcode::QrCode::with_error_correction_level(link.as_bytes(), qrcode::EcLevel::M).ok()?;
+        let s = code.render::<svg::Color>().min_dimensions(200, 200).dark_color(svg::Color("#000000")).light_color(svg::Color("#ffffff")).build();
+        // Inline in the page: without the XML declaration.
+        Some(s[s.find("<svg")?..].to_owned())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn ports_are_added_where_missing() {
+            assert_eq!(with_port("frp.example.com", 47100), "frp.example.com:47100");
+            assert_eq!(with_port("frp.example.com:7000", 47100), "frp.example.com:7000");
+            assert_eq!(with_port("1.2.3.4", 47100), "1.2.3.4:47100");
+            assert_eq!(with_port("fd00::1", 47100), "[fd00::1]:47100");
+            assert_eq!(with_port("[fd00::1]:9", 47100), "[fd00::1]:9");
+        }
+
+        #[test]
+        fn external_addresses_come_first() {
+            let cfg = ServerConfig { public_address: "a.example.com:7000， b.example.com".into(), ..Default::default() };
+            let a = addresses(&cfg);
+            assert_eq!(a[..2], ["a.example.com:7000".to_owned(), format!("b.example.com:{}", cfg.port)]);
+            assert!(a.len() <= MAX);
+            let cfg = ServerConfig { bind: "100.64.0.2".into(), ..Default::default() };
+            assert_eq!(addresses(&cfg), [format!("100.64.0.2:{}", cfg.port)]);
+            assert!(qr_svg(&"x".repeat(300)).unwrap().contains("<svg"));
+        }
+    }
 }

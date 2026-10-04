@@ -27,6 +27,10 @@ pub struct ServerConfig {
     pub log_level: String,
     /// Look for new versions on GitHub Releases (installing is always manual).
     pub check_updates: bool,
+    /// Addresses clients reach this computer at from elsewhere (port
+    /// forwarding, frp: `host:port`, comma separated), put in pairing links
+    /// before the local IPs. Only the link uses it.
+    pub public_address: String,
 }
 
 impl Default for ServerConfig {
@@ -42,6 +46,7 @@ impl Default for ServerConfig {
             audio: true,
             log_level: "info".into(),
             check_updates: true,
+            public_address: String::new(),
         }
     }
 }

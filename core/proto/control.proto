@@ -174,7 +174,8 @@ message ResetPairingCode {}
 
 message Pairing {
   string code = 1;
-  string fingerprint = 2;
+  string fingerprint = 2;      // short form, for people to compare
+  string fingerprint_hex = 3;  // full SHA-256 (pairing links pin it); empty from older services
 }
 
 // ---- settings (server.toml) --------------------------------------------------
@@ -192,6 +193,7 @@ message Config {
   bool audio = 8;
   string log_level = 9;
   bool no_update_check = 10;  // since 2; inverted so older tools keep the checks on
+  string public_address = 11;  // addresses for pairing links besides the local IPs (port forwarding, frp)
 }
 
 // Replaces the whole config; the service validates, saves and applies it.

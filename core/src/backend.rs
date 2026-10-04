@@ -74,10 +74,10 @@ impl Backend {
     pub fn pairing(&mut self) -> Result<cpb::Pairing> {
         match self {
             Backend::Live(c) => c.pairing(),
-            Backend::Offline(d) => Ok(cpb::Pairing {
-                code: load_or_create_key(d, false)?.to_code(),
-                fingerprint: Identity::load_or_create(d)?.fingerprint().to_string(),
-            }),
+            Backend::Offline(d) => {
+                let fp = Identity::load_or_create(d)?.fingerprint();
+                Ok(cpb::Pairing { code: load_or_create_key(d, false)?.to_code(), fingerprint: fp.to_string(), fingerprint_hex: fp.to_hex() })
+            }
         }
     }
 

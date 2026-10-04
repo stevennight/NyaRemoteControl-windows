@@ -19,6 +19,8 @@ pub enum Phase {
     Pairing(String),
     PinChanged(String),
     Verify(String, String),
+    /// A pairing link was opened: connect to this host (name, addresses)?
+    Invite(String, Vec<String>),
 }
 
 impl Phase {
@@ -29,6 +31,7 @@ impl Phase {
             Phase::Pairing(l) => json!({ "phase": "pairing", "label": l }),
             Phase::PinChanged(l) => json!({ "phase": "pin_changed", "label": l }),
             Phase::Verify(l, fp) => json!({ "phase": "verify", "label": l, "fingerprint": fp }),
+            Phase::Invite(l, a) => json!({ "phase": "invite", "label": l, "addresses": a }),
         }
     }
 }
@@ -303,6 +306,22 @@ impl App {
                 }
                 Ok(Value::Null)
             }
+            "invite_ok" => {
+                let ok = c.args.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                self.set_phase(Phase::Idle);
+                match self.offered.take() {
+                    Some(invite) if ok && self.pending.is_none() => self.connect_invite(invite, None, None),
+                    _ => {}
+                }
+                Ok(Value::Null)
+            }
+            // A pairing link on the clipboard (the add dialog offers it).
+            "clipboard_link" => Ok(nya_win::clipboard::get_text()
+                .ok()
+                .flatten()
+                .filter(|t| t.len() < 4096)
+                .and_then(|t| nya_transport::invite::Invite::parse(&t).map(|i| i.to_link()))
+                .map_or(Value::Null, Value::String)),
             "fingerprint_ok" => {
                 let ok = c.args.get("ok").and_then(Value::as_bool).unwrap_or(false);
                 self.set_phase(Phase::Idle);
@@ -320,6 +339,9 @@ impl App {
                 let address = a.address.trim().to_owned();
                 if address.is_empty() {
                     return Err("请输入地址".to_string());
+                }
+                if nya_transport::invite::Invite::parse(&address).is_some() {
+                    return Err("配对链接要连接一次才能完成配对，请点“连接”".to_string());
                 }
                 if self.cfg.hosts.iter().any(|h| h.address == address) {
                     return Err("这个地址已经保存过了".to_string());

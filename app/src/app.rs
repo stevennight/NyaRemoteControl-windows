@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nya_proto::pb::{self, cursor_msg, input_msg::Ev};
+use nya_transport::invite::Invite;
 use nya_transport::{Fingerprint, Identity};
 use nya_ui::Gui;
 use nya_win::d3d::D3dDevice;
@@ -42,6 +43,8 @@ struct Pending {
     /// Command-line settings for this connection only.
     overrides: Option<crate::config::Overrides>,
     reverify: bool,
+    /// Connecting through a pairing link: its addresses, certificate and code.
+    invite: Option<Invite>,
 }
 
 pub struct App {
@@ -56,6 +59,10 @@ pub struct App {
     host: host::HostPanel,
     /// Page the launcher opens on (`--page`), handed out once.
     start_page: Option<String>,
+    /// A `nyaremote://` link the program was started with (asked about once the page is up).
+    start_link: Option<String>,
+    /// An opened pairing link waiting for the user's yes (`Phase::Invite`).
+    offered: Option<Invite>,
     /// The current connection (see `conn`) and the parked others.
     conn_id: u64,
     next_conn: u64,
@@ -208,8 +215,11 @@ impl App {
         auto_connect: Option<(String, Option<String>, crate::config::Overrides)>,
         start_page: Option<String>,
         start_in_tray: bool,
+        start_link: Option<String>,
     ) -> Self {
         Self {
+            start_link,
+            offered: None,
             start_in_tray,
             host: host::HostPanel::new(ui_tx.clone()),
             start_page,
@@ -390,11 +400,49 @@ impl App {
     // --------------------------------------------------------------- connecting
 
     fn connect(&mut self, target: String, name: Option<String>, overrides: Option<crate::config::Overrides>) {
+        if let Some(invite) = Invite::parse(&target) {
+            return self.connect_invite(invite, name, overrides);
+        }
         let entry = self.cfg.find(&target).cloned();
         let address = entry.as_ref().map(|e| e.address.clone()).unwrap_or(target);
         let name = name.filter(|n| !n.trim().is_empty() && entry.is_none());
         let label = entry.as_ref().map(|e| e.name.clone()).or_else(|| name.clone());
-        self.start_connect(Pending { address, label, name, overrides, reverify: false });
+        self.start_connect(Pending { address, label, name, overrides, reverify: false, invite: None });
+    }
+
+    /// Connect through a pairing link: all its addresses at once (a saved
+    /// host with the same certificate: its address first), pairing with the
+    /// link's code.
+    fn connect_invite(&mut self, mut invite: Invite, name: Option<String>, overrides: Option<crate::config::Overrides>) {
+        let fp = invite.fingerprint.map(|f| f.to_hex());
+        let saved = fp.and_then(|fp| self.cfg.hosts.iter().find(|h| h.fingerprint == fp)).cloned();
+        if let Some(h) = &saved {
+            invite.addresses.retain(|a| *a != h.address);
+            invite.addresses.insert(0, h.address.clone());
+        }
+        let name = name.filter(|n| !n.trim().is_empty()).or_else(|| Some(invite.name.clone()).filter(|n| !n.is_empty()));
+        let label = saved.as_ref().map(|h| h.name.clone()).or_else(|| name.clone());
+        let address = invite.addresses[0].clone();
+        tracing::info!("pairing link: {} address(es), {}", invite.addresses.len(), if invite.fingerprint.is_some() { "pinned" } else { "no fingerprint" });
+        self.start_connect(Pending { address, label, name, overrides, reverify: false, invite: Some(invite) });
+    }
+
+    /// A `nyaremote://` link was opened: ask before connecting (a link from
+    /// someone else would send them this computer's keyboard and clipboard).
+    fn offer_invite(&mut self, link: &str) {
+        self.bring_launcher_back();
+        let Some(invite) = Invite::parse(link) else {
+            self.notice(Kind::Error, "配对链接无效或不完整（复制时少了一部分？）");
+            return;
+        };
+        if self.pending.is_some() {
+            self.notice(Kind::Error, "正在连接其他设备，请稍后再打开链接");
+            return;
+        }
+        let label = if invite.name.is_empty() { invite.addresses[0].clone() } else { invite.name.clone() };
+        tracing::info!("pairing link opened: {label} ({})", invite.addresses.join(", "));
+        self.set_phase(Phase::Invite(label, invite.addresses.clone()));
+        self.offered = Some(invite);
     }
 
     /// This computer's name as hosts show it.
@@ -419,6 +467,9 @@ impl App {
     }
 
     fn start_connect(&mut self, p: Pending) {
+        if let Some(invite) = p.invite.clone() {
+            return self.start_connect_invite(p, invite);
+        }
         let pinned = if p.reverify {
             None
         } else {
@@ -452,7 +503,28 @@ impl App {
                     (Err(m), pm)
                 }
             };
-            ui.send(UiEvent::ConnectDone(ConnectDone { attempt, result, pin_mismatch }));
+            ui.send(UiEvent::ConnectDone(ConnectDone { attempt, result, pin_mismatch, address: None }));
+        });
+        self.set_phase(Phase::Connecting(Self::pending_label(&p)));
+        self.pending = Some(p);
+        self.connect_task = Some(task);
+        self.request_redraw();
+    }
+
+    fn start_connect_invite(&mut self, p: Pending, invite: Invite) {
+        self.attempt += 1;
+        let attempt = self.attempt;
+        let (id, name, ui) = (self.identity.clone(), self.client_name(), self.ui_tx.clone());
+        let transport = net::Transport::parse(&self.cfg.settings_for(&p.address).transport);
+        let code = invite.code.clone();
+        let prompt: PairPrompt = Arc::new(move || Some(code.clone()));
+        let task = self.rt.spawn(async move {
+            let res = net::connect_any(&invite.addresses, &id, invite.fingerprint, &name, Some(prompt), transport).await;
+            let (result, address) = match res {
+                Ok((a, l)) => (Ok(Box::new(l)), Some(a)),
+                Err(e) => (Err(format!("{e:#}")), None),
+            };
+            ui.send(UiEvent::ConnectDone(ConnectDone { attempt, result, pin_mismatch: false, address }));
         });
         self.set_phase(Phase::Connecting(Self::pending_label(&p)));
         self.pending = Some(p);
@@ -477,6 +549,9 @@ impl App {
             return; // cancelled
         }
         self.connect_task = None;
+        if let (Some(a), Some(p)) = (done.address, self.pending.as_mut()) {
+            p.address = a;
+        }
         let label = self.pending.as_ref().map(Self::pending_label).unwrap_or_default();
         match done.result {
             Ok(link) => {
@@ -1153,6 +1228,9 @@ impl ApplicationHandler<UiEvent> for App {
         if let Some((target, name, overrides)) = self.auto_connect.take() {
             self.connect(target, name, Some(overrides));
         }
+        if let Some(link) = self.start_link.take() {
+            self.offer_invite(&link);
+        }
         self.draw();
     }
 
@@ -1316,6 +1394,7 @@ impl ApplicationHandler<UiEvent> for App {
                     w.reply(id, r);
                 }
             }
+            UiEvent::OpenLink(link) => self.offer_invite(&link),
             UiEvent::NeedPairing(tx) => {
                 self.pair_reply = Some(tx);
                 let label = self.pending.as_ref().map(Self::pending_label).unwrap_or_default();

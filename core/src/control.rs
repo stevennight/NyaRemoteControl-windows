@@ -38,6 +38,7 @@ pub fn config_to_pb(c: &ServerConfig) -> cpb::Config {
         audio: c.audio,
         log_level: c.log_level.clone(),
         no_update_check: !c.check_updates,
+        public_address: c.public_address.clone(),
     }
 }
 
@@ -54,6 +55,7 @@ pub fn config_from_pb(c: cpb::Config) -> ServerConfig {
         audio: c.audio,
         log_level: c.log_level,
         check_updates: !c.no_update_check,
+        public_address: c.public_address,
     }
 }
 

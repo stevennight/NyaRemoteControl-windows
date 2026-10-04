@@ -152,7 +152,9 @@ fn main() {
 }
 
 fn real_main() -> Result<()> {
-    let cli = Cli::parse();
+    // A clicked pairing link (`nyaremote://…`, registered by the installer).
+    let link = std::env::args_os().nth(1).and_then(|a| a.into_string().ok()).filter(|a| nya_transport::invite::Invite::looks_like(a));
+    let cli = if link.is_some() { Cli::parse_from(["NyaRemoteControl"]) } else { Cli::parse() };
     let dir = config::data_dir();
     std::fs::create_dir_all(&dir)?;
     let _log = init_logging(&dir);
@@ -181,7 +183,7 @@ fn real_main() -> Result<()> {
     };
     // One program per user session: started again, it shows the running one.
     let instance = if auto_connect.is_none() {
-        match tray::claim() {
+        match tray::claim(&dir, link.as_deref()) {
             Some(i) => Some(i),
             None => return Ok(()),
         }
@@ -194,11 +196,11 @@ fn real_main() -> Result<()> {
     let event_loop = EventLoop::<UiEvent>::with_user_event().build().map_err(|e| anyhow!("{e}"))?;
     let ui = Ui::new(event_loop.create_proxy());
     if let Some(i) = instance {
-        i.listen(ui.clone());
+        i.listen(ui.clone(), dir.clone());
     }
     // A start-with-Windows entry follows the program (updates, moves).
     tray::autostart::refresh();
-    let mut app = app::App::new(rt.handle().clone(), ui, dir, cfg, identity, auto_connect, cli.page, cli.tray);
+    let mut app = app::App::new(rt.handle().clone(), ui, dir, cfg, identity, auto_connect, cli.page, cli.tray && link.is_none(), link);
     event_loop.run_app(&mut app).map_err(|e| anyhow!("{e}"))?;
     // Let the Bye go out.
     rt.shutdown_timeout(std::time::Duration::from_millis(300));

@@ -285,6 +285,11 @@ Section "-程序文件" SecFiles
   WriteRegStr HKLM "${UNINST_KEY}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
   WriteRegDWORD HKLM "${UNINST_KEY}" "NoModify" 1
   WriteRegDWORD HKLM "${UNINST_KEY}" "NoRepair" 1
+  ; Pairing links (nyaremote://pair?…, from a host's 本机 page) open the program.
+  WriteRegStr HKLM "Software\Classes\nyaremote" "" "URL:NyaRemoteControl 配对链接"
+  WriteRegStr HKLM "Software\Classes\nyaremote" "URL Protocol" ""
+  WriteRegStr HKLM "Software\Classes\nyaremote\DefaultIcon" "" "$INSTDIR\${APP_EXE},0"
+  WriteRegStr HKLM "Software\Classes\nyaremote\shell\open\command" "" '"$INSTDIR\${APP_EXE}" "%1"'
 SectionEnd
 
 Section "桌面快捷方式" SecDesktop
@@ -404,6 +409,7 @@ Section "Uninstall"
   !insertmacro DeleteShortcuts
   RMDir /r "$INSTDIR"
   DeleteRegKey HKLM "${UNINST_KEY}"
+  DeleteRegKey HKLM "Software\Classes\nyaremote"
   ; Start with Windows (set by the program for the user who turned it on).
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APP_NAME}"
 SectionEnd

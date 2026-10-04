@@ -144,7 +144,57 @@ pub async fn connect(
     mode: Transport,
     prefer_tcp: bool,
 ) -> Result<Link> {
-    let (endpoint, conn, via_tcp) = open(addr, id, pinned, mode, prefer_tcp).await.with_context(|| format!("连接 {addr} 失败"))?;
+    let opened = open(addr, id, pinned, mode, prefer_tcp).await.with_context(|| format!("连接 {addr} 失败"))?;
+    handshake(addr, opened, id, pinned, client_name, prompt).await
+}
+
+/// A pairing link: try all its addresses at once; the first that answers
+/// (with the link's certificate, when it has one) is used. Returns that address.
+pub async fn connect_any(
+    targets: &[String],
+    id: &Identity,
+    pinned: Option<Fingerprint>,
+    client_name: &str,
+    prompt: Option<PairPrompt>,
+    mode: Transport,
+) -> Result<(String, Link)> {
+    let mut set = tokio::task::JoinSet::new();
+    for (i, t) in targets.iter().enumerate() {
+        let (t, id) = (t.clone(), id.clone());
+        set.spawn(async move {
+            let r = async {
+                let addr = tokio::task::spawn_blocking(move || nya_transport::endpoint::resolve(&t, nya_proto::DEFAULT_PORT)).await??;
+                Ok::<_, anyhow::Error>((addr, open(addr, &id, pinned, mode, false).await?))
+            }
+            .await;
+            (i, r)
+        });
+    }
+    let mut errors = Vec::new();
+    while let Some(r) = set.join_next().await {
+        let Ok((i, r)) = r else { continue };
+        match r {
+            Ok((addr, opened)) => {
+                set.abort_all();
+                tracing::info!("pairing link: {} answered", targets[i]);
+                let link = handshake(addr, opened, id, pinned, client_name, prompt).await?;
+                return Ok((targets[i].clone(), link));
+            }
+            Err(e) => errors.push(format!("{}：{e:#}", targets[i])),
+        }
+    }
+    bail!("链接里的地址都连不上（{}）", errors.join("；"))
+}
+
+/// The session handshake on an opened connection (and pairing if the host asks for it).
+async fn handshake(
+    addr: SocketAddr,
+    (endpoint, conn, via_tcp): Opened,
+    id: &Identity,
+    pinned: Option<Fingerprint>,
+    client_name: &str,
+    prompt: Option<PairPrompt>,
+) -> Result<Link> {
     tracing::info!("connected to {addr} over {}", if via_tcp { "TCP" } else { "UDP" });
     let server_fp = peer_fingerprint(&conn).ok_or_else(|| anyhow!("被控端没有证书"))?;
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -843,5 +893,73 @@ mod tests {
         let (_ep, _conn, tcp) = open(addr, &client_id, pin, Transport::Auto, true).await.unwrap();
         assert!(tcp && start.elapsed() < HEAD_START);
         assert!(open(addr, &client_id, pin, Transport::Udp, false).await.is_err(), "no UDP there");
+    }
+
+    /// A host that pairs with `key` (the host's side of the handshake).
+    fn pairing_host(id: &Identity, key: PairingKey) -> SocketAddr {
+        let server = nya_transport::endpoint::server_endpoint("127.0.0.1:0".parse().unwrap(), id).unwrap();
+        let addr = server.local_addr().unwrap();
+        let server_fp = id.fingerprint();
+        tokio::spawn(async move {
+            while let Some(i) = server.accept().await {
+                let key = key.clone();
+                tokio::spawn(async move {
+                    let Ok(conn) = i.await else { return };
+                    let client_fp = peer_fingerprint(&conn).unwrap();
+                    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+                    let hello: pb::Hello = expect_msg(&mut recv, MAX_MESSAGE_LEN).await.unwrap();
+                    let n = negotiate::negotiate(&hello, &LocalVersion::current()).unwrap();
+                    let welcome = pb::Welcome {
+                        proto_major: n.major,
+                        proto_minor: n.minor,
+                        server_name: "host".into(),
+                        server_version: "test".into(),
+                        features: n.features.iter().copied().collect(),
+                        needs_pairing: true,
+                    };
+                    write_msg(&mut send, &pb::HelloReply { reply: Some(pb::hello_reply::Reply::Welcome(welcome)) }).await.unwrap();
+                    let server_nonce = pairing::nonce();
+                    write_msg(&mut send, &ctl(Msg::AuthChallenge(pb::AuthChallenge { server_nonce: server_nonce.to_vec() }))).await.unwrap();
+                    let r: pb::ControlMsg = expect_msg(&mut recv, MAX_MESSAGE_LEN).await.unwrap();
+                    let Some(Msg::AuthResponse(r)) = r.msg else { panic!("expected AuthResponse") };
+                    let t = Transcript { server_nonce: &server_nonce, client_nonce: &r.client_nonce, server_fp, client_fp };
+                    let ok = t.verify_client(&key, &r.mac);
+                    let server_mac = if ok { t.server_mac(&key) } else { vec![] };
+                    write_msg(&mut send, &ctl(Msg::AuthResult(pb::AuthResult { ok, server_mac, message: "配对码错误".into() }))).await.unwrap();
+                    conn.closed().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// A pairing link: of a dead address, another host (not the link's
+    /// certificate) and the host, the host is used, paired with the link's code.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pairing_link_finds_the_host_and_pairs() {
+        let (host_id, other_id, client_id) = (Identity::generate().unwrap(), Identity::generate().unwrap(), Identity::generate().unwrap());
+        let key = PairingKey::generate();
+        let host = pairing_host(&host_id, key.clone()).to_string();
+        let other = pairing_host(&other_id, key.clone()).to_string();
+        let dead = "127.0.0.1:9".to_owned();
+        let invite = nya_transport::invite::Invite {
+            name: "host".into(),
+            addresses: vec![dead, other, host.clone()],
+            fingerprint: Some(host_id.fingerprint()),
+            code: key.to_code(),
+        };
+        let invite = nya_transport::invite::Invite::parse(&invite.to_link()).unwrap();
+        let code = invite.code.clone();
+        let prompt: PairPrompt = Arc::new(move || Some(code.clone()));
+        let (used, link) =
+            connect_any(&invite.addresses, &client_id, invite.fingerprint, "client", Some(prompt), Transport::Udp).await.unwrap();
+        assert_eq!(used, host);
+        assert_eq!(link.server_fp, host_id.fingerprint());
+        assert!(link.welcome.needs_pairing);
+
+        // A stale code (the host's was regenerated): pairing fails.
+        let prompt: PairPrompt = Arc::new(|| Some(PairingKey::generate().to_code()));
+        let e = connect_any(&[host], &client_id, invite.fingerprint, "client", Some(prompt), Transport::Udp).await.err().unwrap();
+        assert!(format!("{e:#}").contains("配对失败"), "{e:#}");
     }
 }
