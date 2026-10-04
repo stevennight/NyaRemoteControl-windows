@@ -432,7 +432,7 @@ pub fn auto_hide_bar(ctx: &egui::Context, id: &str, pinned: bool, tab: &str, con
                     .stroke(egui::Stroke::new(1.0_f32, Color32::from_white_alpha(18)))
                     .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 })
                     .inner_margin(egui::Margin::symmetric(10, 1))
-                    .show(ui, |ui| ui.add(egui::Label::new(RichText::new(format!("▾ {tab}")).small().color(DIM)).selectable(false)));
+                    .show(ui, |ui| ui.add(egui::Label::new(RichText::new(format!("▾ {tab}")).small().color(DIM)).selectable(false).extend()));
                 ui.interact(f.response.rect, egui::Id::new((id, "grip")), egui::Sense::click_and_drag())
             })
             .inner;
@@ -476,6 +476,11 @@ pub fn auto_hide_bar(ctx: &egui::Context, id: &str, pinned: bool, tab: &str, con
             frame.corner_radius(12).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 ui.spacing_mut().button_padding = egui::vec2(9.0, 5.0);
+                // A horizontal row starts this tall and centres each item as it
+                // is placed: as tall as the buttons, or what comes before the
+                // first button (host name, latency) sits too high.
+                let row = ui.text_style_height(&egui::TextStyle::Button) + 2.0 * 5.0;
+                ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(row);
                 {
                     // Flat buttons on the bar; menus keep the normal look.
                     let w = &mut ui.visuals_mut().widgets;
@@ -551,17 +556,20 @@ pub fn session_overlay(
                 let color = if latency > 0.0 { latency_color(latency) } else { DIM };
                 let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                 ui.painter().circle_filled(dot.center(), 3.5, color);
-                ui.add_space(4.0);
-                ui.label(RichText::new(&s.label).strong().color(Color32::WHITE));
+                // Name and latency as one text: one baseline.
+                let mut job = egui::text::LayoutJob::default();
+                let style = ui.style().clone();
+                RichText::new(&s.label).strong().color(Color32::WHITE).append_to(&mut job, &style, egui::FontSelection::Default, egui::Align::BOTTOM);
                 if latency > 0.0 {
-                    let text = RichText::new(format!("{latency:.0} ms")).small().color(color);
-                    if ui
-                        .add(egui::Button::new(text).frame(false))
-                        .on_hover_text("端到端延迟。点击显示 / 隐藏统计信息（Ctrl+Alt+Shift+S）")
-                        .clicked()
-                    {
-                        actions.push(Action::Hotkey(Hotkey::ToggleStats));
-                    }
+                    RichText::new(format!("  {latency:.0} ms")).small().color(color).append_to(&mut job, &style, egui::FontSelection::Default, egui::Align::BOTTOM);
+                }
+                let r = ui.scope(|ui| {
+                    ui.spacing_mut().button_padding.x = 4.0;
+                    ui.add(egui::Button::new(job).frame(false))
+                });
+                let hint = if latency > 0.0 { "端到端延迟。点击显示 / 隐藏统计信息（Ctrl+Alt+Shift+S）" } else { "点击显示 / 隐藏统计信息（Ctrl+Alt+Shift+S）" };
+                if r.inner.on_hover_text(hint).clicked() {
+                    actions.push(Action::Hotkey(Hotkey::ToggleStats));
                 }
                 if let Some(r) = s.role.as_ref().filter(|r| r.controlling && !r.viewers.is_empty()) {
                     ui.label(RichText::new(format!("· {} 人观看", r.viewers.len())).small().color(DIM))
@@ -852,6 +860,9 @@ mod bar_tests {
         menu: Cell<bool>,
         button: Cell<Option<egui::Rect>>,
         menu_rect: Cell<Option<egui::Rect>>,
+        /// Window width.
+        width: f32,
+        label: Cell<Option<egui::Rect>>,
     }
 
     impl Sim {
@@ -864,6 +875,8 @@ mod bar_tests {
                 menu: Cell::new(false),
                 button: Cell::new(None),
                 menu_rect: Cell::new(None),
+                width: 1000.0,
+                label: Cell::new(None),
             }
         }
 
@@ -872,7 +885,7 @@ mod bar_tests {
             let mut all = vec![egui::Event::PointerMoved(self.pos)];
             all.extend(events);
             let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(self.width, 700.0))),
                 time: Some(self.time),
                 events: all,
                 ..Default::default()
@@ -883,7 +896,7 @@ mod bar_tests {
                 auto_hide_bar(ctx, "toolbar", false, "host", |ui, menu_open| {
                     self.bar.set(true);
                     ui.horizontal(|ui| {
-                        ui.label("host");
+                        self.label.set(Some(ui.label("host").rect));
                         let r = ui.menu_button("屏幕 1 ▾", |ui| {
                             *menu_open = true;
                             self.menu.set(true);
@@ -1002,6 +1015,43 @@ mod bar_tests {
         s.move_to(egui::pos2(bar.center().x, bar.bottom()));
         s.wait(1.0);
         assert!(!s.bar.get(), "the old bar area must not reopen it");
+    }
+
+    #[test]
+    fn the_handle_is_one_line() {
+        let mut s = Sim::started();
+        let line = s.ctx.style().text_styles[&egui::TextStyle::Small].size;
+        let handle = |s: &Sim| s.ctx.memory(|m| m.area_rect(egui::Id::new(("toolbar", "handle")))).expect("handle shown");
+        assert!(handle(&s).height() < line * 2.0, "handle {:?} wraps (small text {line})", handle(&s));
+        // The window started tiny (created hidden) and then grew.
+        let mut t = Sim::new();
+        t.width = 40.0;
+        t.frame(0.0, vec![]);
+        t.wait(0.3);
+        t.width = 1000.0;
+        t.wait(0.5);
+        assert!(handle(&t).height() < line * 2.0, "handle {:?} wraps after the window grew", handle(&t));
+        // Dragged to the right edge: little room to its right.
+        s.move_to(HANDLE);
+        s.press(true);
+        for x in (500..1000).step_by(25) {
+            s.move_to(egui::pos2(x as f32, 6.0));
+        }
+        s.press(false);
+        s.move_to(egui::pos2(500.0, 300.0));
+        s.wait(1.0);
+        let r = handle(&s);
+        assert!(r.right() > 900.0, "dragged: {r:?}");
+        assert!(r.height() < line * 2.0, "handle {r:?} wraps at the edge (small text {line})");
+    }
+
+    /// What comes before the first button (host name) is centred with the buttons.
+    #[test]
+    fn the_bar_is_aligned() {
+        let mut s = Sim::started();
+        s.open_from_handle();
+        let (label, button) = (s.label.get().unwrap(), s.button.get().unwrap());
+        assert!((label.center().y - button.center().y).abs() < 1.0, "label {label:?}, button {button:?}");
     }
 
     #[test]
