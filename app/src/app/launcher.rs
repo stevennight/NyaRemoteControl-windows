@@ -247,7 +247,7 @@ impl App {
                 }
                 let exe = std::env::current_exe().map_err(|e| e.to_string())?;
                 let page = c.args.get("page").and_then(Value::as_str).filter(|p| p.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-')).unwrap_or("host");
-                nya_win::package::start_elevated(&exe, &format!("--page {page}")).map_err(|e| format!("{e:#}"))?;
+                nya_win::package::start_elevated(&exe, &format!("--page {page} --relaunched")).map_err(|e| format!("{e:#}"))?;
                 self.exit = true;
                 Ok(Value::Null)
             })(),

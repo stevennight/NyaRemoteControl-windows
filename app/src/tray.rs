@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::core::w;
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE};
 
 use crate::events::{Ui, UiEvent};
@@ -78,14 +78,30 @@ fn link_file(dir: &Path) -> PathBuf {
     dir.join("open-link.txt")
 }
 
+/// How long a relaunched program waits for the one that started it to quit.
+const RELAUNCH_WAIT_MS: u32 = 15_000;
+
 /// `Some` if this is the only instance; otherwise the running one was asked
 /// to show itself (and open `link`) and this one should quit.
-pub fn claim(dir: &Path, link: Option<&str>) -> Option<Instance> {
+/// `relaunched`: started by the running program in its place (reopened as
+/// administrator), which quits right after: wait for it, then take over.
+pub fn claim(dir: &Path, link: Option<&str>, relaunched: bool) -> Option<Instance> {
     // SAFETY: named kernel objects of this user session; the handles live as
     // long as the process (the mutex marks it as running).
     unsafe {
-        let _mutex = CreateMutexW(None, true, w!("Local\\NyaRemoteControl.App"));
-        if GetLastError() == ERROR_ALREADY_EXISTS {
+        let mutex = CreateMutexW(None, true, w!("Local\\NyaRemoteControl.App"));
+        let mut exists = GetLastError() == ERROR_ALREADY_EXISTS;
+        if exists && relaunched {
+            if let Ok(m) = mutex {
+                // Ours once the previous program has quit (abandoned or released).
+                let r = WaitForSingleObject(m, RELAUNCH_WAIT_MS);
+                exists = r != WAIT_OBJECT_0 && r != WAIT_ABANDONED;
+                if exists {
+                    tracing::warn!("relaunched, but the previous program is still running");
+                }
+            }
+        }
+        if exists {
             if let Some(l) = link {
                 if let Err(e) = std::fs::write(link_file(dir), l) {
                     tracing::warn!("hand over the link: {e}");

@@ -55,6 +55,9 @@ struct Cli {
     /// Start in the tray, without the window (starting with Windows).
     #[arg(long, hide = true)]
     tray: bool,
+    /// Started by the running program in its place (reopened as administrator).
+    #[arg(long, hide = true)]
+    relaunched: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -183,7 +186,7 @@ fn real_main() -> Result<()> {
     };
     // One program per user session: started again, it shows the running one.
     let instance = if auto_connect.is_none() {
-        match tray::claim(&dir, link.as_deref()) {
+        match tray::claim(&dir, link.as_deref(), cli.relaunched) {
             Some(i) => Some(i),
             None => return Ok(()),
         }
