@@ -123,6 +123,8 @@ pub struct App {
     sync_extras: bool,
     /// Virtual screen (1-based) created for a new window, until it appears.
     pending_virtual: Option<u32>,
+    /// Last real size of each window (see `guard_size`).
+    normal_sizes: std::collections::HashMap<WindowId, LogicalSize<f64>>,
 }
 
 /// The program's icon (resource 1, from common/assets/client.ico) for the
@@ -270,6 +272,7 @@ impl App {
             auto_opened: Default::default(),
             sync_extras: false,
             pending_virtual: None,
+            normal_sizes: Default::default(),
         }
     }
 
@@ -361,6 +364,38 @@ impl App {
         }
         let slot = s.view_of(id)?;
         self.extras.values().find(|w| w.slot == slot).map(|w| (w.window.clone(), w.fullscreen))
+    }
+
+    /// Keeps a window from shrinking to nothing. winit sizes a window on a
+    /// DPI change from its client area, which is 0×0 while it is minimized
+    /// (RDP reconnects, display changes): the window would come back as a
+    /// 16×39 sliver. The window's last real size is used instead, and a window
+    /// that is restored that small anyway gets it back.
+    fn guard_size(&mut self, w: &Window, event: &mut WindowEvent) {
+        const TINY: f64 = 100.0;
+        let fallback = LogicalSize::new(1100.0, 760.0);
+        let minimized = w.is_minimized() == Some(true);
+        match event {
+            WindowEvent::Resized(size) if !minimized => {
+                let logical = size.to_logical::<f64>(w.scale_factor());
+                if logical.width >= TINY && logical.height >= TINY {
+                    self.normal_sizes.insert(w.id(), logical);
+                } else if w.fullscreen().is_none() {
+                    let back = self.normal_sizes.get(&w.id()).copied().unwrap_or(fallback);
+                    tracing::warn!("window {:?} restored at {}x{}, back to {:.0}x{:.0}", w.id(), size.width, size.height, back.width, back.height);
+                    let _ = w.request_inner_size(back);
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, inner_size_writer } => {
+                let inner = w.inner_size().to_logical::<f64>(w.scale_factor());
+                if minimized || inner.width < TINY || inner.height < TINY {
+                    let keep = self.normal_sizes.get(&w.id()).copied().unwrap_or(fallback);
+                    tracing::info!("scale {scale_factor} while minimized: window {:?} keeps {:.0}x{:.0}", w.id(), keep.width, keep.height);
+                    let _ = inner_size_writer.request_inner_size(keep.to_physical(*scale_factor));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// A virtual screen sized for `w` (following the settings); `None` while
@@ -1234,15 +1269,23 @@ impl ApplicationHandler<UiEvent> for App {
         self.draw();
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        if self.launcher.as_ref().is_some_and(|l| l.id() == id) {
-            return self.launcher_event(el, event);
-        }
-        match self.conn_of_window(id) {
-            Some(c) => {
-                self.activate(c);
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, mut event: WindowEvent) {
+        let launcher = self.launcher.as_ref().is_some_and(|l| l.id() == id);
+        if !launcher {
+            match self.conn_of_window(id) {
+                Some(c) => {
+                    self.activate(c);
+                }
+                None => return,
             }
-            None => return,
+        }
+        // The window is now the launcher, `self.window` or one of `self.extras`.
+        let win = [self.launcher.as_ref(), self.window.as_ref()].into_iter().flatten().find(|w| w.id() == id).cloned();
+        if let Some(w) = win.or_else(|| self.extras.get(&id).map(|e| e.window.clone())) {
+            self.guard_size(&w, &mut event);
+        }
+        if launcher {
+            return self.launcher_event(el, event);
         }
         let Some(window) = self.window.clone() else { return };
         if id != window.id() {
