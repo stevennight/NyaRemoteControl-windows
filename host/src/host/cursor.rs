@@ -59,10 +59,11 @@ impl CursorLog {
 }
 
 /// The pointer as Windows sees it: hot spot in output pixels, and whether it
-/// shows on this output. On the virtual display DXGI loses it (the driver
-/// takes the pointer as a hardware cursor): only shape changes come with a
-/// position, every other update says hidden at (0,0). `None` when the thread
-/// cannot ask (not on the input desktop).
+/// shows on this output. DXGI's pointer position is unreliable: on the
+/// virtual display (its driver takes the pointer as a hardware cursor) and on
+/// some physical HDR displays only shape changes come with a position, every
+/// other update says hidden at (0,0), and the image has no pointer either.
+/// `None` when the thread cannot ask (not on the input desktop).
 pub fn os_pointer(rect: &DisplayRect) -> Option<(i32, i32, bool)> {
     let mut ci = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
     unsafe { GetCursorInfo(&mut ci) }.ok()?;

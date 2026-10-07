@@ -107,9 +107,6 @@ pub struct Pipeline {
     keyframe_pending: bool,
     last_keyframe: Instant,
     cursor: CursorTracker,
-    /// Pointer position and visibility from Windows rather than DXGI (the
-    /// virtual display; see [`cursor::os_pointer`]).
-    pub os_cursor: bool,
     stats: Stats,
     /// Encode times of the last 10 s, for the 99th percentile.
     encode_window: nya_proto::stats::Rolling,
@@ -118,6 +115,9 @@ pub struct Pipeline {
     diag: CaptureCounters,
     /// Consecutive access-lost errors without an image; switches API after 5.
     lost_streak: u32,
+    /// Input desktop of the last copied image: a duplication re-created on
+    /// the same desktop keeps that picture rather than an unpresented image.
+    image_desktop: String,
     legacy_dup: bool,
 }
 
@@ -339,13 +339,13 @@ impl Pipeline {
             keyframe_pending: true,
             last_keyframe: now - Duration::from_secs(1),
             cursor: CursorTracker::default(),
-            os_cursor: false,
             stats: Stats::default(),
             encode_window: Default::default(),
             built_at: now,
             warned_no_image: false,
             diag: CaptureCounters::default(),
             lost_streak: 0,
+            image_desktop: String::new(),
             legacy_dup: false,
         })
     }
@@ -428,13 +428,20 @@ impl Pipeline {
                 Duplicator::new(&self.capture, &self.output)
             };
             match created {
-                Ok(d) => {
+                Ok(mut d) => {
                     if (d.width, d.height) != self.native {
                         return Step::Rebuild(format!("resolution changed to {}x{}", d.width, d.height));
                     }
+                    // Access lost on the same desktop (some HDR displays keep losing
+                    // it): the picture we have is current; no black first image, no
+                    // keyframe each time. A new desktop (lock screen, UAC) starts afresh.
+                    if self.have_image && desktop.name() == self.image_desktop {
+                        d.skip_unpresented_first();
+                    } else {
+                        self.keyframe_pending = true;
+                    }
                     self.dup = Some(d);
                     self.dup_failures = 0;
-                    self.keyframe_pending = true;
                     // HDR may have been switched on or off, or its SDR brightness changed.
                     self.recheck_format = true;
                 }
@@ -468,6 +475,9 @@ impl Pipeline {
                         tracing::warn!("copy desktop: {e:#}");
                     } else {
                         self.have_image = true;
+                        if self.image_desktop != desktop.name() {
+                            self.image_desktop = desktop.name().to_string();
+                        }
                         self.dirty = true;
                         self.last_change = Instant::now();
                         self.refine_left = REFINE_FRAMES;
@@ -480,9 +490,8 @@ impl Pipeline {
             }
             Ok(None) => {
                 self.diag.timeouts += 1;
-                if self.os_cursor {
-                    self.send_cursor(sink, PointerUpdate::default());
-                }
+                // The pointer moves without desktop updates too.
+                self.send_cursor(sink, PointerUpdate::default());
             }
             Err(DupError::AccessLost) => {
                 // Desktop switch (lock screen, UAC), mode change or fullscreen transition.
@@ -531,9 +540,11 @@ impl Pipeline {
         Step::Ok
     }
 
+    /// Shape from DXGI; position and visibility from Windows, as DXGI's are
+    /// unreliable (see [`cursor::os_pointer`]). DXGI's when Windows won't say.
     fn send_cursor(&mut self, sink: &Sink, pointer: PointerUpdate) {
         let mut msgs = Vec::new();
-        match self.os_cursor.then(|| cursor::os_pointer(&self.rect)).flatten() {
+        match cursor::os_pointer(&self.rect) {
             Some(pos) => self.cursor.update_os(pointer.shape, pos, &mut msgs),
             None => self.cursor.update(pointer, &mut msgs),
         }
@@ -637,6 +648,15 @@ impl Pipeline {
             return;
         }
         let d = std::mem::take(&mut self.diag);
+        if d.encoded >= 5 && d.access_lost > 0 {
+            tracing::info!(
+                "{}: duplication access lost {}x in 5 s ({} images, {} encoded)",
+                self.output_name,
+                d.access_lost,
+                d.images,
+                d.encoded
+            );
+        }
         if d.encoded < 5 {
             tracing::warn!(
                 "capture status (5 s): acquired={} images={} timeouts={} access_lost={} dup_failures={} encoded={} inflight={} have_image={} desktop={}",
