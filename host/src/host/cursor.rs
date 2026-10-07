@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use nya_proto::pb::{self, cursor_msg::Msg};
 use nya_win::duplication::{CursorShape, PointerUpdate};
+use nya_win::input::DisplayRect;
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING, CURSOR_SUPPRESSED};
 
 #[derive(Default)]
 pub struct CursorTracker {
@@ -56,6 +58,20 @@ impl CursorLog {
     }
 }
 
+/// The pointer as Windows sees it: hot spot in output pixels, and whether it
+/// shows on this output. On the virtual display DXGI loses it (the driver
+/// takes the pointer as a hardware cursor): only shape changes come with a
+/// position, every other update says hidden at (0,0). `None` when the thread
+/// cannot ask (not on the input desktop).
+pub fn os_pointer(rect: &DisplayRect) -> Option<(i32, i32, bool)> {
+    let mut ci = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+    unsafe { GetCursorInfo(&mut ci) }.ok()?;
+    let (x, y) = (ci.ptScreenPos.x - rect.left, ci.ptScreenPos.y - rect.top);
+    let inside = x >= 0 && y >= 0 && x < rect.width as i32 && y < rect.height as i32;
+    let showing = ci.flags.0 & CURSOR_SHOWING.0 != 0 && ci.flags.0 & CURSOR_SUPPRESSED.0 == 0 && !ci.hCursor.is_invalid();
+    Some((x, y, showing && inside))
+}
+
 /// Opaque pixels of a straight-alpha RGBA image (a cursor with none is invisible).
 pub fn opaque_pixels(rgba: &[u8]) -> usize {
     rgba.chunks_exact(4).filter(|p| p[3] != 0).count()
@@ -69,6 +85,13 @@ fn shape_id(s: &CursorShape) -> u32 {
 }
 
 impl CursorTracker {
+    /// Like [`Self::update`], with the position from [`os_pointer`] (hot
+    /// spot) instead of DXGI's; DXGI still provides the shape.
+    pub fn update_os(&mut self, shape: Option<CursorShape>, (x, y, visible): (i32, i32, bool), out: &mut Vec<pb::CursorMsg>) {
+        let (hx, hy) = shape.as_ref().map(|s| (s.hot_x, s.hot_y)).or(self.shape.map(|(_, hx, hy)| (hx, hy))).unwrap_or((0, 0));
+        self.update(PointerUpdate { position: Some((x - hx, y - hy, visible)), shape }, out);
+    }
+
     /// Turn a DXGI pointer update into messages for the client.
     pub fn update(&mut self, p: PointerUpdate, out: &mut Vec<pb::CursorMsg>) {
         if let Some(s) = p.shape {
@@ -156,6 +179,8 @@ mod tests {
         out.clear();
         t.update(PointerUpdate { position: Some((10, 20, true)), shape: Some(shape()) }, &mut out);
         assert!(out.is_empty(), "nothing changed");
+        t.update_os(None, (11, 21, true), &mut out);
+        assert!(out.is_empty(), "the OS position is the hot spot");
         t.update(PointerUpdate { position: Some((12, 20, true)), shape: None }, &mut out);
         assert_eq!(out.len(), 1);
     }

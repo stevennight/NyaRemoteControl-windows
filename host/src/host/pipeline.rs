@@ -17,7 +17,7 @@ use nya_win::convert::{Converter, TargetFormat};
 use nya_win::d3d::{tex_desc, D3dDevice};
 use nya_win::desktop::DesktopTracker;
 use nya_win::display_config;
-use nya_win::duplication::{DupError, Duplicator};
+use nya_win::duplication::{DupError, Duplicator, PointerUpdate};
 use nya_win::input::DisplayRect;
 use nya_win::topology::{OutputInfo, Topology};
 use nya_win::transfer::Readback;
@@ -30,7 +30,7 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
 use windows::Win32::Graphics::Dxgi::IDXGIOutput;
 
-use super::cursor::CursorTracker;
+use super::cursor::{self, CursorTracker};
 use super::select::{self, Plan};
 use super::{HostConfig, Sink};
 use crate::ipc_pb::{host_event::Ev, VideoFrame};
@@ -107,6 +107,9 @@ pub struct Pipeline {
     keyframe_pending: bool,
     last_keyframe: Instant,
     cursor: CursorTracker,
+    /// Pointer position and visibility from Windows rather than DXGI (the
+    /// virtual display; see [`cursor::os_pointer`]).
+    pub os_cursor: bool,
     stats: Stats,
     /// Encode times of the last 10 s, for the 99th percentile.
     encode_window: nya_proto::stats::Rolling,
@@ -336,6 +339,7 @@ impl Pipeline {
             keyframe_pending: true,
             last_keyframe: now - Duration::from_secs(1),
             cursor: CursorTracker::default(),
+            os_cursor: false,
             stats: Stats::default(),
             encode_window: Default::default(),
             built_at: now,
@@ -472,16 +476,14 @@ impl Pipeline {
                 if let Some(d) = self.dup.as_mut() {
                     d.release();
                 }
-                let mut msgs = Vec::new();
-                self.cursor.update(frame.pointer, &mut msgs);
-                for mut m in msgs {
-                    if let Some(pb::cursor_msg::Msg::State(st)) = m.msg.as_mut() {
-                        st.slot = self.slot;
-                    }
-                    sink.send(Ev::Cursor(m));
+                self.send_cursor(sink, frame.pointer);
+            }
+            Ok(None) => {
+                self.diag.timeouts += 1;
+                if self.os_cursor {
+                    self.send_cursor(sink, PointerUpdate::default());
                 }
             }
-            Ok(None) => self.diag.timeouts += 1,
             Err(DupError::AccessLost) => {
                 // Desktop switch (lock screen, UAC), mode change or fullscreen transition.
                 self.diag.access_lost += 1;
@@ -527,6 +529,20 @@ impl Pipeline {
         }
         self.report_stats(sink);
         Step::Ok
+    }
+
+    fn send_cursor(&mut self, sink: &Sink, pointer: PointerUpdate) {
+        let mut msgs = Vec::new();
+        match self.os_cursor.then(|| cursor::os_pointer(&self.rect)).flatten() {
+            Some(pos) => self.cursor.update_os(pointer.shape, pos, &mut msgs),
+            None => self.cursor.update(pointer, &mut msgs),
+        }
+        for mut m in msgs {
+            if let Some(pb::cursor_msg::Msg::State(st)) = m.msg.as_mut() {
+                st.slot = self.slot;
+            }
+            sink.send(Ev::Cursor(m));
+        }
     }
 
     fn encode(&mut self, sink: &Sink, refine: bool) -> Result<()> {

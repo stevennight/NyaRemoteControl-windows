@@ -463,6 +463,7 @@ fn build(st: &mut State, slot: u32, cfg: &HostConfig, desktop: &mut DesktopTrack
         .ok_or_else(|| "没有可用的显示器".to_string())?
         .clone();
     check_capture(&st.topo, &output, desktop)?;
+    let on_virtual = st.vd.as_ref().is_some_and(|vd| vd.gdi_names().iter().any(|n| n.eq_ignore_ascii_case(&output.device_name)));
     let plans = select::plans(&st.probes, output.adapter_index, &req, st.caps.as_ref(), &cfg.encoder, output.hdr);
     let mut errors = Vec::new();
     for plan in plans {
@@ -483,7 +484,11 @@ fn build(st: &mut State, slot: u32, cfg: &HostConfig, desktop: &mut DesktopTrack
             desktop,
             slot,
         ) {
-            Ok(p) => {
+            Ok(mut p) => {
+                p.os_cursor = on_virtual;
+                if on_virtual {
+                    tracing::info!("virtual display: pointer position and visibility from Windows, shape from DXGI");
+                }
                 if !errors.is_empty() {
                     tracing::info!("fell back to {:?} {:?} after {} failures", p.backend(), plan.codec, errors.len());
                 }
