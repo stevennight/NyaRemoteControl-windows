@@ -964,6 +964,8 @@ impl App {
                 ui::session_overlay(ctx, s, toolbar_open, fullscreen, hovering_file, &mut actions)
             }
         });
+        let over_ui = gui.ctx.is_pointer_over_area() || gui.ctx.is_using_pointer();
+        self.sync_cursor_after_ui(over_ui, frame.cursor_set);
 
         let mut fresh = false;
         if let Some(s) = &mut self.session {
@@ -1047,16 +1049,40 @@ impl App {
             return;
         }
         self.cursor_over_ui = over;
-        let (Some(w), Some(s)) = (&self.window, &self.session) else { return };
         if over {
-            w.set_cursor(CursorIcon::Default);
-            w.set_cursor_visible(true);
-        } else if !s.relative {
-            if let Some(c) = s.cursors.get(&s.cursor_shape) {
-                w.set_cursor(c.clone());
+            if let (Some(w), Some(_)) = (&self.window, &self.session) {
+                w.set_cursor(CursorIcon::Default);
+                w.set_cursor_visible(true);
             }
-            w.set_cursor_visible(s.cursor_visible);
+        } else {
+            self.show_remote_cursor();
         }
+    }
+
+    /// After a UI frame. egui sets its own cursor when its icon changes or the
+    /// pointer comes back into the window; outside the toolbar the remote
+    /// cursor goes back (it stayed a local arrow, or showed while hidden).
+    fn sync_cursor_after_ui(&mut self, over: bool, egui_set: bool) {
+        if egui_set {
+            self.cursor_over_ui = over;
+            if !over {
+                self.show_remote_cursor();
+            }
+        } else {
+            self.update_cursor_over_ui(over);
+        }
+    }
+
+    fn show_remote_cursor(&self) {
+        let (Some(w), Some(s)) = (&self.window, &self.session) else { return };
+        if s.relative {
+            w.set_cursor_visible(false);
+            return;
+        }
+        if let Some(c) = s.cursors.get(&s.cursor_shape) {
+            w.set_cursor(c.clone());
+        }
+        w.set_cursor_visible(s.cursor_visible);
     }
 
     fn on_cursor(&mut self, el: &ActiveEventLoop, m: pb::CursorMsg) {
@@ -1081,10 +1107,13 @@ impl App {
                 // Cursor of a display shown in an extra window.
                 // (Fields, not methods: `s` borrows the session.)
                 let Some(w) = self.extras.values().find(|w| w.slot == st.slot).map(|w| w.window.clone()) else { return };
-                if let Some(c) = s.cursors.get(&st.shape_id) {
-                    w.set_cursor(c.clone());
-                }
                 if let Some(v) = s.views.get_mut(&st.slot) {
+                    if v.cursor_shape != st.shape_id {
+                        if let Some(c) = s.cursors.get(&st.shape_id) {
+                            w.set_cursor(c.clone());
+                            v.cursor_shape = st.shape_id;
+                        }
+                    }
                     if v.cursor_visible != st.visible {
                         v.cursor_visible = st.visible;
                         w.set_cursor_visible(st.visible);

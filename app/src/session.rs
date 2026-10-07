@@ -57,6 +57,7 @@ pub struct View {
     pub server_stats: Option<pb::ServerStats>,
     pub stream: Option<pb::StreamStarted>,
     pub current: Option<Arc<Slot>>,
+    pub cursor_shape: u32,
     pub cursor_visible: bool,
     pub status: String,
 }
@@ -300,6 +301,7 @@ impl Session {
                 server_stats: None,
                 stream: None,
                 current: None,
+                cursor_shape: 0,
                 cursor_visible: true,
                 status: "连接中".into(),
             },

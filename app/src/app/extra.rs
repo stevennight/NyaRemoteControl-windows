@@ -317,6 +317,15 @@ impl App {
         let fullscreen = w.fullscreen;
         let mut action = ExtraAction::None;
         let frame = w.gui.run(&window, |ctx| action = ui::extra_overlay(ctx, &title, &status, fullscreen));
+        // egui set its own cursor (pointer came back, or left a button): the remote one again.
+        if frame.cursor_set && !(w.gui.ctx.is_pointer_over_area() || w.gui.ctx.is_using_pointer()) {
+            if let Some(v) = s.views.get(&w.slot) {
+                if let Some(c) = s.cursors.get(&v.cursor_shape) {
+                    window.set_cursor(c.clone());
+                }
+                window.set_cursor_visible(v.cursor_visible);
+            }
+        }
         let res = (|| -> anyhow::Result<()> {
             let rtv = w.renderer.begin()?;
             if let Some(c) = &current {
