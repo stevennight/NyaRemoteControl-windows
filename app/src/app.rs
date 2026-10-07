@@ -1064,6 +1064,15 @@ impl App {
     /// cursor goes back (it stayed a local arrow, or showed while hidden).
     fn sync_cursor_after_ui(&mut self, over: bool, egui_set: bool) {
         if egui_set {
+            if let Some(s) = self.session.as_mut() {
+                if s.cursor_log.line() {
+                    tracing::info!(
+                        "ui set the cursor (over toolbar {over}); remote cursor {} shape {:08x}",
+                        if s.cursor_visible { "shown" } else { "hidden" },
+                        s.cursor_shape
+                    );
+                }
+            }
             self.cursor_over_ui = over;
             if !over {
                 self.show_remote_cursor();
@@ -1089,6 +1098,10 @@ impl App {
         let Some(s) = self.session.as_mut() else { return };
         match m.msg {
             Some(cursor_msg::Msg::Shape(sh)) => {
+                if s.cursor_log.line() {
+                    let opaque = sh.rgba.chunks_exact(4).filter(|p| p[3] != 0).count();
+                    tracing::info!("cursor shape {:08x}: {}x{} hot ({},{}) opaque {opaque}", sh.id, sh.width, sh.height, sh.hot_x, sh.hot_y);
+                }
                 let src = CustomCursor::from_rgba(
                     sh.rgba,
                     sh.width.min(u16::MAX as u32) as u16,
@@ -1100,7 +1113,7 @@ impl App {
                     Ok(src) => {
                         s.cursors.insert(sh.id, el.create_custom_cursor(src));
                     }
-                    Err(e) => tracing::debug!("cursor shape: {e}"),
+                    Err(e) => tracing::warn!("cursor shape {:08x}: {e}", sh.id),
                 }
             }
             Some(cursor_msg::Msg::State(st)) if st.slot != 0 => {
@@ -1112,9 +1125,12 @@ impl App {
                         if let Some(c) = s.cursors.get(&st.shape_id) {
                             w.set_cursor(c.clone());
                             v.cursor_shape = st.shape_id;
+                        } else if s.cursor_log.line() {
+                            tracing::info!("cursor state names unknown shape {:08x} (slot {})", st.shape_id, st.slot);
                         }
                     }
                     if v.cursor_visible != st.visible {
+                        s.cursor_log.visibility(st.visible, st.slot, st.shape_id);
                         v.cursor_visible = st.visible;
                         w.set_cursor_visible(st.visible);
                     }
@@ -1128,9 +1144,12 @@ impl App {
                             w.set_cursor(c.clone());
                         }
                         s.cursor_shape = st.shape_id;
+                    } else if s.cursor_log.line() {
+                        tracing::info!("cursor state names unknown shape {:08x}", st.shape_id);
                     }
                 }
                 if st.visible != s.cursor_visible {
+                    s.cursor_log.visibility(st.visible, 0, st.shape_id);
                     s.cursor_visible = st.visible;
                     if !s.relative && !self.cursor_over_ui {
                         w.set_cursor_visible(st.visible);

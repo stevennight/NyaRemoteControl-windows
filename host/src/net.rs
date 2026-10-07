@@ -330,7 +330,15 @@ async fn run_session(
             }
         }
     });
-    let cursor_task = tokio::spawn(cursor_writer(conn.clone(), cursor_rx));
+    let cursor_task = tokio::spawn({
+        let conn = conn.clone();
+        async move {
+            if let Err(e) = cursor_writer(conn, cursor_rx).await {
+                tracing::warn!("cursor writer: {e:#}");
+            }
+        }
+    });
+    let mut cursor_dropped = 0u64;
     let mic_on = neg.has(Feature::Microphone);
     let mic_task = tokio::spawn({
         let (conn, hub, controlling) = (conn.clone(), hub.clone(), controlling.clone());
@@ -650,7 +658,12 @@ async fn run_session(
                         }
                     }
                     Some(Ev::Cursor(c)) => {
-                        let _ = cursor_tx.try_send(c);
+                        if cursor_tx.try_send(c).is_err() {
+                            cursor_dropped += 1;
+                            if cursor_dropped.is_power_of_two() {
+                                tracing::warn!("cursor stream backed up: {cursor_dropped} cursor updates dropped");
+                            }
+                        }
                     }
                     Some(Ev::Audio(a)) => {
                         if audio_on {

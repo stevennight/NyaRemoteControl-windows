@@ -62,6 +62,42 @@ pub struct View {
     pub status: String,
 }
 
+/// Cursor events in the client log: the first ones one by one, then a
+/// summary now and then (the pointer vanishing is chased with it).
+#[derive(Default)]
+pub struct CursorLog {
+    lines: u32,
+    hides: u32,
+    shows: u32,
+    since: Option<Instant>,
+}
+
+impl CursorLog {
+    const LINES: u32 = 300;
+
+    /// Whether one more event may be logged on its own line.
+    pub fn line(&mut self) -> bool {
+        self.lines += 1;
+        self.lines <= Self::LINES
+    }
+
+    pub fn visibility(&mut self, visible: bool, slot: u32, shape: u32) {
+        if visible {
+            self.shows += 1;
+        } else {
+            self.hides += 1;
+        }
+        if self.line() {
+            tracing::info!("remote cursor {} (slot {slot}, shape {shape:08x})", if visible { "shown" } else { "hidden" });
+        }
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if self.lines > Self::LINES && since.elapsed() >= Duration::from_secs(10) {
+            tracing::info!("remote cursor (10 s+): {} hidden, {} shown; now {}", self.hides, self.shows, if visible { "shown" } else { "hidden" });
+            (self.hides, self.shows, self.since) = (0, 0, Some(Instant::now()));
+        }
+    }
+}
+
 pub struct SessionOptions {
     pub hw_decode: bool,
     pub audio: bool,
@@ -120,6 +156,7 @@ pub struct Session {
     pub cursors: HashMap<u32, CustomCursor>,
     pub cursor_shape: u32,
     pub cursor_visible: bool,
+    pub cursor_log: CursorLog,
     pub relative: bool,
     pub game: bool,
     pub show_stats: bool,
@@ -223,6 +260,7 @@ impl Session {
             cursors: HashMap::new(),
             cursor_shape: 0,
             cursor_visible: true,
+            cursor_log: CursorLog::default(),
             relative: false,
             game,
             show_stats: false,
