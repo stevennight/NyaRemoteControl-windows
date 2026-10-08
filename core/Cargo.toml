@@ -1,7 +1,7 @@
 [package]
 name = "nya-server-core"
 description = "NyaRemoteControl host: what the service and the management program share (settings, pairing data, control protocol). No capture / encoding stack."
-version = "0.10.4-beta.4"
+version = "0.10.4-beta.5"
 edition = "2021"
 license = "MIT"
 publish = false
