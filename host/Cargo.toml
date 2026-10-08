@@ -1,7 +1,7 @@
 [package]
 name = "nya-server"
 description = "NyaRemoteControl host: Windows service, per-session helper and standalone mode (nya-server-svc.exe)"
-version = "0.10.4-beta.5"
+version = "0.10.4"
 edition = "2021"
 license = "MIT"
 publish = false
