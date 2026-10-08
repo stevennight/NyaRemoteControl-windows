@@ -51,8 +51,18 @@ const MIN_KEYFRAME_GAP: Duration = Duration::from_millis(300);
 // switches don't count.
 /// Re-creations after access was lost on the same desktop, per 5 s window...
 const GDI_LOSSES_PER_WINDOW: u32 = 3;
-/// ...in this many windows in a row (15 s).
-const GDI_BAD_WINDOWS: u32 = 3;
+/// ...in this many windows in a row (10 s).
+const GDI_BAD_WINDOWS: u32 = 2;
+/// A display that needed GDI this recently starts on GDI again (switching back
+/// to it shouldn't wait out the detection again); duplication is probed soon.
+const GDI_REMEMBER: Duration = Duration::from_secs(600);
+const GDI_REMEMBERED_PROBE: Duration = Duration::from_secs(5);
+/// How long the client is told about the switch to GDI.
+const GDI_NOTE_TIME: Duration = Duration::from_secs(8);
+
+/// Displays (GDI names) that needed the GDI fallback, and when.
+static GDI_NEEDED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(Default::default);
 const GDI_MAX_FPS: u32 = 30;
 /// While on GDI, test duplication in the background this often...
 const GDI_PROBE_EVERY: Duration = Duration::from_secs(60);
@@ -155,6 +165,7 @@ pub struct Pipeline {
     gdi_next_probe: Instant,
     /// Frames and milliseconds since the instant, for the log.
     gdi_stats: (u32, f32, Instant),
+    gdi_since: Instant,
     legacy_dup: bool,
 }
 
@@ -343,7 +354,7 @@ impl Pipeline {
             if cross { " (cross-GPU)" } else { "" }
         );
         let now = Instant::now();
-        Ok(Self {
+        let mut p = Self {
             slot,
             plan: plan.clone(),
             stream_id,
@@ -404,8 +415,15 @@ impl Pipeline {
             gdi_probe: None,
             gdi_next_probe: now,
             gdi_stats: (0, 0.0, now),
+            gdi_since: now,
             legacy_dup: false,
-        })
+        };
+        let remembered = GDI_NEEDED.lock().unwrap().get(&p.output_name).is_some_and(|t| t.elapsed() < GDI_REMEMBER);
+        if remembered {
+            p.start_gdi(0, desktop.name());
+            p.gdi_next_probe = now + GDI_REMEMBERED_PROBE;
+        }
+        Ok(p)
     }
 
     pub fn backend(&self) -> Backend {
@@ -513,12 +531,18 @@ impl Pipeline {
         }
         match GdiCapture::new(self.rect.left, self.rect.top, self.rect.width, self.rect.height) {
             Ok(g) => {
-                tracing::warn!(
-                    "{}: desktop duplication kept losing access on the same desktop for {secs} s; capturing with GDI \
-                     (slower), trying duplication again every {} s",
-                    self.output_name,
-                    GDI_PROBE_EVERY.as_secs()
-                );
+                if secs == 0 {
+                    tracing::info!("{}: needed GDI capture a short while ago; starting with it", self.output_name);
+                } else {
+                    tracing::warn!(
+                        "{}: desktop duplication kept losing access on the same desktop for {secs} s; capturing with GDI \
+                         (slower), trying duplication again every {} s",
+                        self.output_name,
+                        GDI_PROBE_EVERY.as_secs()
+                    );
+                }
+                GDI_NEEDED.lock().unwrap().insert(self.output_name.clone(), now);
+                self.gdi_since = now;
                 self.gdi = Some(g);
                 self.gdi_desktop = desktop.to_string();
                 self.dup = None;
@@ -672,6 +696,7 @@ impl Pipeline {
         }
         if p.since.elapsed() >= GDI_PROBE_TIME {
             let p = self.gdi_probe.take().unwrap();
+            GDI_NEEDED.lock().unwrap().remove(&self.output_name);
             self.stop_gdi("desktop duplication works again", false);
             self.dup = Some(p.dup);
         }
@@ -961,6 +986,18 @@ impl Pipeline {
         self.diag.since = Some(Instant::now());
     }
 
+    /// For the client while the capture has trouble (`ServerStats.capture_note`).
+    fn capture_note(&self) -> String {
+        if self.gdi.is_some() {
+            if self.gdi_since.elapsed() < GDI_NOTE_TIME {
+                return "这块显示器无法正常截取画面（可能已关闭），已改用备用截取方式，画面会稍卡".into();
+            }
+        } else if self.bad_windows > 0 || self.diag.relost >= GDI_LOSSES_PER_WINDOW {
+            return "这块显示器的画面截取反复中断（显示器可能已关闭），正在改用备用截取方式…".into();
+        }
+        String::new()
+    }
+
     fn report_stats(&mut self, sink: &Sink) {
         let since = *self.stats.since.get_or_insert_with(Instant::now);
         let elapsed = since.elapsed();
@@ -984,6 +1021,7 @@ impl Pipeline {
             slot: self.slot,
             path_loss_pct: 0.0, // filled in by the network side
             path_rtt_ms: 0.0,
+            capture_note: self.capture_note(),
         }));
         self.stats.since = Some(Instant::now());
     }

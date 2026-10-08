@@ -175,6 +175,21 @@ fn parse_chroma(s: &str) -> pb::Chroma {
 const UNLIMITED_KBPS: u32 = 80_000;
 
 /// Virtual display sizes: width a multiple of 8, height even, at least 640x480.
+/// The host's note about trouble with the capture (`ServerStats.capture_note`)
+/// as the status line while it lasts; cleared when the host stops sending it,
+/// unless another status replaced it meanwhile.
+fn show_capture_note(shown: &mut String, status: &mut String, note: &str) {
+    if note == shown.as_str() {
+        return;
+    }
+    if !note.is_empty() {
+        *status = note.to_string();
+    } else if status == shown {
+        status.clear();
+    }
+    *shown = note.to_string();
+}
+
 fn vd_dims(w: u32, h: u32) -> (u32, u32) {
     ((w & !7).max(640), (h & !1).max(480))
 }
@@ -1628,11 +1643,19 @@ impl ApplicationHandler<UiEvent> for App {
                         s.status = format!("被控端无法开始推流：{e}");
                     }
                     UiEvent::ServerStats(st) if st.slot != 0 => {
-                        if let Some(v) = s.views.get_mut(&st.slot) {
+                        let slot = st.slot;
+                        if let Some(v) = s.views.get_mut(&slot) {
+                            show_capture_note(&mut v.capture_note, &mut v.status, &st.capture_note);
                             v.server_stats = Some(st);
                         }
+                        if let Some(id) = self.extra_of_slot(slot) {
+                            self.extras[&id].window.request_redraw();
+                        }
                     }
-                    UiEvent::ServerStats(st) => s.server_stats = Some(st),
+                    UiEvent::ServerStats(st) => {
+                        show_capture_note(&mut s.capture_note, &mut s.status, &st.capture_note);
+                        s.server_stats = Some(st);
+                    }
                     UiEvent::Transport { tcp } => s.via_tcp = Some(tcp),
                     UiEvent::Clipboard(t) => s.clipboard_from_host(t),
                     UiEvent::Reconnecting(msg) => {

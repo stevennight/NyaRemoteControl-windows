@@ -60,6 +60,7 @@ pub struct View {
     pub cursor_shape: u32,
     pub cursor_visible: bool,
     pub status: String,
+    pub capture_note: String,
 }
 
 /// Cursor events in the client log: the first ones one by one, then a
@@ -157,6 +158,8 @@ pub struct Session {
     pub cursor_shape: u32,
     pub cursor_visible: bool,
     pub cursor_log: CursorLog,
+    /// Host's capture note shown as the status (`ServerStats.capture_note`).
+    pub capture_note: String,
     pub relative: bool,
     pub game: bool,
     pub show_stats: bool,
@@ -261,6 +264,7 @@ impl Session {
             cursor_shape: 0,
             cursor_visible: true,
             cursor_log: CursorLog::default(),
+            capture_note: String::new(),
             relative: false,
             game,
             show_stats: false,
@@ -342,6 +346,7 @@ impl Session {
                 cursor_shape: 0,
                 cursor_visible: true,
                 status: "连接中".into(),
+                capture_note: String::new(),
             },
         );
         tracing::info!("extra window: display {display_id} in slot {slot}");
