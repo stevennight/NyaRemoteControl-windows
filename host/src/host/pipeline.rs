@@ -18,6 +18,7 @@ use nya_win::d3d::{tex_desc, D3dDevice};
 use nya_win::desktop::DesktopTracker;
 use nya_win::display_config;
 use nya_win::duplication::{DupError, Duplicator, PointerUpdate};
+use nya_win::gdi::{self, GdiCapture};
 use nya_win::input::DisplayRect;
 use nya_win::topology::{OutputInfo, Topology};
 use nya_win::transfer::Readback;
@@ -27,7 +28,7 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11ShaderResourceView, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
     D3D11_TEXTURE2D_DESC,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT};
 use windows::Win32::Graphics::Dxgi::IDXGIOutput;
 
 use super::cursor::{self, CursorTracker};
@@ -41,6 +42,26 @@ const MAX_INFLIGHT: u32 = 2;
 const REFINE_FRAMES: u32 = 4;
 const REFINE_DELAY: Duration = Duration::from_millis(60);
 const MIN_KEYFRAME_GAP: Duration = Duration::from_millis(300);
+
+// GDI fallback. Desktop Duplication on some outputs keeps losing access on the
+// same desktop and hands back a stale picture (a switched-off display, likely
+// behind a VGA adapter: ~1 loss/s). Only then, after it lasted a while, the
+// stream copies the screen with GDI, which costs a CPU copy of the output per
+// frame. Healthy outputs don't lose access on one desktop; lock screen / UAC
+// switches don't count.
+/// Re-creations after access was lost on the same desktop, per 5 s window...
+const GDI_LOSSES_PER_WINDOW: u32 = 3;
+/// ...in this many windows in a row (15 s).
+const GDI_BAD_WINDOWS: u32 = 3;
+const GDI_MAX_FPS: u32 = 30;
+/// While on GDI, test duplication in the background this often...
+const GDI_PROBE_EVERY: Duration = Duration::from_secs(60);
+/// ...for this long; without access losses it takes over again.
+const GDI_PROBE_TIME: Duration = Duration::from_secs(10);
+/// No GDI for this long after GDI read black or failed.
+const GDI_COOLDOWN: Duration = Duration::from_secs(120);
+/// GDI reading only black this long: protected / exclusive-fullscreen content.
+const GDI_BLACK_LIMIT: Duration = Duration::from_secs(3);
 
 pub enum Step {
     Ok,
@@ -118,7 +139,30 @@ pub struct Pipeline {
     /// Input desktop of the last copied image: a duplication re-created on
     /// the same desktop keeps that picture rather than an unpresented image.
     image_desktop: String,
+    /// 5 s windows in a row with duplication losing access on one desktop.
+    bad_windows: u32,
+    /// GDI fallback (see `GDI_LOSSES_PER_WINDOW`); `None` = Desktop Duplication.
+    gdi: Option<GdiCapture>,
+    gdi_prev: Vec<u8>,
+    /// Input desktop the GDI screen DC belongs to.
+    gdi_desktop: String,
+    gdi_last: Instant,
+    gdi_desktop_check: Instant,
+    gdi_cursor: isize,
+    gdi_black_since: Option<Instant>,
+    gdi_cooldown_until: Instant,
+    gdi_probe: Option<DupProbe>,
+    gdi_next_probe: Instant,
+    /// Frames and milliseconds since the instant, for the log.
+    gdi_stats: (u32, f32, Instant),
     legacy_dup: bool,
+}
+
+/// Desktop Duplication tried in the background while the GDI fallback runs.
+struct DupProbe {
+    dup: Duplicator,
+    since: Instant,
+    losses: u32,
 }
 
 /// Capture counters, logged every 5 s while the stream isn't producing frames.
@@ -127,6 +171,8 @@ struct CaptureCounters {
     since: Option<Instant>,
     acquired: u32,
     images: u32,
+    /// Duplications re-created after a loss on the same desktop.
+    relost: u32,
     timeouts: u32,
     access_lost: u32,
     dup_failures: u32,
@@ -346,6 +392,18 @@ impl Pipeline {
             diag: CaptureCounters::default(),
             lost_streak: 0,
             image_desktop: String::new(),
+            bad_windows: 0,
+            gdi: None,
+            gdi_prev: Vec::new(),
+            gdi_desktop: String::new(),
+            gdi_last: now,
+            gdi_desktop_check: now,
+            gdi_cursor: 0,
+            gdi_black_since: None,
+            gdi_cooldown_until: now,
+            gdi_probe: None,
+            gdi_next_probe: now,
+            gdi_stats: (0, 0.0, now),
             legacy_dup: false,
         })
     }
@@ -416,10 +474,247 @@ impl Pipeline {
         let interval = Duration::from_secs_f64(1.0 / self.fps as f64);
         let next_due = self.last_encode + interval;
 
+        if self.gdi.is_some() {
+            if let Some(step) = self.step_gdi(sink, desktop, max_wait) {
+                return step;
+            }
+        } else if let Some(step) = self.step_dda(sink, desktop, now, next_due, max_wait) {
+            return step;
+        }
+
+        let now = Instant::now();
+        if self.inflight >= MAX_INFLIGHT && now - self.last_frame_sent > Duration::from_secs(3) {
+            tracing::warn!("no FrameSent for 3 s; resetting flow control");
+            self.inflight = 0;
+        }
+        let due = now >= next_due;
+        let refine = !self.dirty && self.refine_left > 0 && now - self.last_change >= REFINE_DELAY;
+        let want = self.have_image
+            && (self.keyframe_pending || (due && (self.dirty || self.game || refine)));
+        if want && self.inflight < MAX_INFLIGHT {
+            if let Err(e) = self.encode(sink, refine) {
+                return Step::Rebuild(format!("encode failed: {e:#}"));
+            }
+        }
+        self.report_stats(sink);
+        Step::Ok
+    }
+
+    /// Switch to the GDI fallback (duplication kept losing access for `secs`).
+    fn start_gdi(&mut self, secs: u32, desktop: &str) {
+        let now = Instant::now();
+        if now < self.gdi_cooldown_until {
+            return;
+        }
+        if (self.rect.width, self.rect.height) != self.native {
+            tracing::info!("{}: duplication keeps losing access, but GDI capture needs an unrotated display", self.output_name);
+            self.gdi_cooldown_until = now + GDI_COOLDOWN;
+            return;
+        }
+        match GdiCapture::new(self.rect.left, self.rect.top, self.rect.width, self.rect.height) {
+            Ok(g) => {
+                tracing::warn!(
+                    "{}: desktop duplication kept losing access on the same desktop for {secs} s; capturing with GDI \
+                     (slower), trying duplication again every {} s",
+                    self.output_name,
+                    GDI_PROBE_EVERY.as_secs()
+                );
+                self.gdi = Some(g);
+                self.gdi_desktop = desktop.to_string();
+                self.dup = None;
+                self.gdi_prev.clear();
+                self.gdi_last = now - Duration::from_secs(1);
+                self.gdi_desktop_check = now;
+                self.gdi_cursor = 0;
+                self.gdi_black_since = None;
+                self.gdi_probe = None;
+                self.gdi_next_probe = now + GDI_PROBE_EVERY;
+                self.gdi_stats = (0, 0.0, now);
+                self.keyframe_pending = true;
+            }
+            Err(e) => {
+                tracing::warn!("{}: GDI capture unavailable: {e:#}", self.output_name);
+                self.gdi_cooldown_until = now + GDI_COOLDOWN;
+            }
+        }
+    }
+
+    /// Back to Desktop Duplication; `cooldown`: GDI didn't work here.
+    fn stop_gdi(&mut self, why: &str, cooldown: bool) {
+        tracing::info!("{}: leaving GDI capture: {why}", self.output_name);
+        let now = Instant::now();
+        self.gdi = None;
+        self.gdi_probe = None;
+        self.gdi_prev = Vec::new();
+        self.bad_windows = 0;
+        if cooldown {
+            self.gdi_cooldown_until = now + GDI_COOLDOWN;
+        }
+        self.next_dup_retry = now;
+        self.keyframe_pending = true;
+        self.recheck_format = true;
+    }
+
+    /// Capture with GDI. `Some` ends this round early.
+    fn step_gdi(&mut self, sink: &Sink, desktop: &mut DesktopTracker, max_wait: Duration) -> Option<Step> {
+        let now = Instant::now();
+        // The screen DC belongs to one desktop; the lock screen / UAC go back to duplication.
+        if now >= self.gdi_desktop_check {
+            self.gdi_desktop_check = now + Duration::from_millis(250);
+            if let Err(e) = desktop.sync() {
+                tracing::debug!("desktop sync: {e:#}");
+            }
+        }
+        // (Another stream on this thread may have done the switch.)
+        if desktop.name() != self.gdi_desktop {
+            self.stop_gdi("input desktop changed", false);
+            return Some(Step::Ok);
+        }
+        self.probe_dup(now);
+        if self.gdi.is_none() {
+            return Some(Step::Ok);
+        }
+        let interval = Duration::from_secs_f64(1.0 / self.fps.clamp(1, GDI_MAX_FPS) as f64);
+        let due = self.gdi_last + interval;
+        if now < due {
+            std::thread::sleep(due.saturating_duration_since(now).min(max_wait));
+            self.send_cursor_gdi(sink);
+            return None;
+        }
+        self.gdi_last = now;
+        let t = Instant::now();
+        let g = self.gdi.as_mut().unwrap();
+        let (changed, black) = match g.grab() {
+            Ok(px) => {
+                let changed = self.gdi_prev.as_slice() != px;
+                if changed {
+                    self.gdi_prev.clear();
+                    self.gdi_prev.extend_from_slice(px);
+                }
+                (changed, gdi::looks_black(px))
+            }
+            Err(e) => {
+                self.stop_gdi(&format!("BitBlt failed: {e}"), true);
+                return Some(Step::Ok);
+            }
+        };
+        self.diag.acquired += 1;
+        if black {
+            if self.gdi_black_since.get_or_insert(now).elapsed() >= GDI_BLACK_LIMIT {
+                self.stop_gdi("GDI reads only black (protected or exclusive-fullscreen content)", true);
+                return Some(Step::Ok);
+            }
+        } else {
+            self.gdi_black_since = None;
+        }
+        if changed {
+            let px = std::mem::take(&mut self.gdi_prev);
+            let uploaded = self.upload_bgra(&px);
+            self.gdi_prev = px;
+            match uploaded {
+                Ok(()) => {
+                    self.diag.images += 1;
+                    self.have_image = true;
+                    if self.image_desktop != desktop.name() {
+                        self.image_desktop = desktop.name().to_string();
+                    }
+                    self.dirty = true;
+                    self.last_change = Instant::now();
+                    self.refine_left = REFINE_FRAMES;
+                }
+                Err(e) => tracing::warn!("upload GDI image: {e:#}"),
+            }
+        }
+        self.gdi_stats.0 += 1;
+        self.gdi_stats.1 += t.elapsed().as_secs_f32() * 1000.0;
+        if self.gdi_stats.2.elapsed() >= Duration::from_secs(30) {
+            let (n, total, _) = self.gdi_stats;
+            tracing::info!("{}: GDI capture: {n} frames in 30 s, {:.1} ms each", self.output_name, total / n.max(1) as f32);
+            self.gdi_stats = (0, 0.0, Instant::now());
+        }
+        self.send_cursor_gdi(sink);
+        None
+    }
+
+    /// While on GDI: give duplication a try now and then; when it keeps
+    /// access for `GDI_PROBE_TIME`, it takes over again.
+    fn probe_dup(&mut self, now: Instant) {
+        if self.gdi_probe.is_none() {
+            if now < self.gdi_next_probe {
+                return;
+            }
+            self.gdi_next_probe = now + GDI_PROBE_EVERY;
+            match Duplicator::new(&self.capture, &self.output) {
+                Ok(dup) if (dup.width, dup.height) == self.native => {
+                    self.gdi_probe = Some(DupProbe { dup, since: now, losses: 0 });
+                }
+                _ => return,
+            }
+        }
+        let p = self.gdi_probe.as_mut().unwrap();
+        match p.dup.acquire(0) {
+            Ok(_) => p.dup.release(),
+            Err(DupError::AccessLost) | Err(DupError::Other(_)) => {
+                p.losses += 1;
+                match Duplicator::new(&self.capture, &self.output) {
+                    Ok(d) if p.losses < 2 => p.dup = d,
+                    _ => {
+                        tracing::debug!("{}: duplication still loses access; staying on GDI", self.output_name);
+                        self.gdi_probe = None;
+                        return;
+                    }
+                }
+            }
+            Err(DupError::DeviceLost) => {
+                self.gdi_probe = None;
+                return;
+            }
+        }
+        if p.since.elapsed() >= GDI_PROBE_TIME {
+            let p = self.gdi_probe.take().unwrap();
+            self.stop_gdi("desktop duplication works again", false);
+            self.dup = Some(p.dup);
+        }
+    }
+
+    /// GDI has no DXGI pointer shapes: the shape comes from the cursor handle.
+    fn send_cursor_gdi(&mut self, sink: &Sink) {
+        let shape = match cursor::os_cursor_handle() {
+            Some(h) if h.0 as isize != self.gdi_cursor => {
+                self.gdi_cursor = h.0 as isize;
+                gdi::cursor_shape(h)
+            }
+            _ => None,
+        };
+        self.send_cursor(sink, PointerUpdate { position: None, shape });
+    }
+
+    /// Put a BGRA image (GDI) where the duplicated desktop goes.
+    fn upload_bgra(&mut self, bgra: &[u8]) -> Result<()> {
+        let (w, h) = (self.rect.width, self.rect.height);
+        let matches = self.desktop.as_ref().is_some_and(|d| {
+            d.desc.Width == w && d.desc.Height == h && d.desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM
+        });
+        if !matches {
+            let tex = self.capture.texture(&tex_desc(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_SHADER_RESOURCE))?;
+            let srv = self.capture.srv(&tex)?;
+            let mut d = D3D11_TEXTURE2D_DESC::default();
+            unsafe { tex.GetDesc(&mut d) };
+            self.desktop = Some(DesktopCopy { tex, srv, desc: d });
+        }
+        // GDI hands out SDR pixels, also from an HDR desktop.
+        self.converter.set_hdr(None);
+        let dc = self.desktop.as_ref().unwrap();
+        unsafe { self.capture.context.UpdateSubresource(&dc.tex, 0, None, bgra.as_ptr() as *const _, w * 4, 0) };
+        Ok(())
+    }
+
+    /// Capture with Desktop Duplication. `Some` ends this round early.
+    fn step_dda(&mut self, sink: &Sink, desktop: &mut DesktopTracker, now: Instant, next_due: Instant, max_wait: Duration) -> Option<Step> {
         if self.dup.is_none() {
             if now < self.next_dup_retry {
                 std::thread::sleep(Duration::from_millis(5));
-                return Step::Ok;
+                return Some(Step::Ok);
             }
             let _ = desktop.sync();
             let created = if self.legacy_dup {
@@ -430,13 +725,14 @@ impl Pipeline {
             match created {
                 Ok(mut d) => {
                     if (d.width, d.height) != self.native {
-                        return Step::Rebuild(format!("resolution changed to {}x{}", d.width, d.height));
+                        return Some(Step::Rebuild(format!("resolution changed to {}x{}", d.width, d.height)));
                     }
                     // Access lost on the same desktop (some HDR displays keep losing
                     // it): the picture we have is current; no black first image, no
                     // keyframe each time. A new desktop (lock screen, UAC) starts afresh.
                     if self.have_image && desktop.name() == self.image_desktop {
                         d.skip_unpresented_first();
+                        self.diag.relost += 1;
                     } else {
                         self.keyframe_pending = true;
                     }
@@ -445,7 +741,7 @@ impl Pipeline {
                     // HDR may have been switched on or off, or its SDR brightness changed.
                     self.recheck_format = true;
                 }
-                Err(DupError::DeviceLost) => return Step::Rebuild("GPU device lost".into()),
+                Err(DupError::DeviceLost) => return Some(Step::Rebuild("GPU device lost".into())),
                 Err(e) => {
                     self.diag.dup_failures += 1;
                     self.dup_failures += 1;
@@ -453,10 +749,10 @@ impl Pipeline {
                         tracing::warn!("DuplicateOutput failed ({}x): {e}", self.dup_failures);
                     }
                     if self.dup_failures > 150 {
-                        return Step::Rebuild(format!("cannot duplicate output: {e}"));
+                        return Some(Step::Rebuild(format!("cannot duplicate output: {e}")));
                     }
                     self.next_dup_retry = now + Duration::from_millis(200);
-                    return Step::Ok;
+                    return Some(Step::Ok);
                 }
             }
         }
@@ -511,33 +807,17 @@ impl Pipeline {
                 // Don't spin: give the desktop switch a moment.
                 self.next_dup_retry = Instant::now() + Duration::from_millis(50);
                 self.dup = None;
-                return Step::Ok;
+                return Some(Step::Ok);
             }
-            Err(DupError::DeviceLost) => return Step::Rebuild("GPU device lost".into()),
+            Err(DupError::DeviceLost) => return Some(Step::Rebuild("GPU device lost".into())),
             Err(DupError::Other(e)) => {
                 tracing::warn!("AcquireNextFrame: {e}");
                 self.dup = None;
                 self.next_dup_retry = Instant::now() + Duration::from_millis(100);
-                return Step::Ok;
+                return Some(Step::Ok);
             }
         }
-
-        let now = Instant::now();
-        if self.inflight >= MAX_INFLIGHT && now - self.last_frame_sent > Duration::from_secs(3) {
-            tracing::warn!("no FrameSent for 3 s; resetting flow control");
-            self.inflight = 0;
-        }
-        let due = now >= next_due;
-        let refine = !self.dirty && self.refine_left > 0 && now - self.last_change >= REFINE_DELAY;
-        let want = self.have_image
-            && (self.keyframe_pending || (due && (self.dirty || self.game || refine)));
-        if want && self.inflight < MAX_INFLIGHT {
-            if let Err(e) = self.encode(sink, refine) {
-                return Step::Rebuild(format!("encode failed: {e:#}"));
-            }
-        }
-        self.report_stats(sink);
-        Step::Ok
+        None
     }
 
     /// Shape from DXGI; position and visibility from Windows, as DXGI's are
@@ -648,6 +928,13 @@ impl Pipeline {
             return;
         }
         let d = std::mem::take(&mut self.diag);
+        if self.gdi.is_none() {
+            self.bad_windows = if d.relost >= GDI_LOSSES_PER_WINDOW { self.bad_windows + 1 } else { 0 };
+            if self.bad_windows >= GDI_BAD_WINDOWS {
+                self.bad_windows = 0;
+                self.start_gdi(GDI_BAD_WINDOWS * 5, desktop.name());
+            }
+        }
         if d.encoded >= 5 && d.access_lost > 0 {
             tracing::info!(
                 "{}: duplication access lost {}x in 5 s ({} images, {} encoded)",

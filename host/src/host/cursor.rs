@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use nya_proto::pb::{self, cursor_msg::Msg};
 use nya_win::duplication::{CursorShape, PointerUpdate};
 use nya_win::input::DisplayRect;
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING, CURSOR_SUPPRESSED};
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING, CURSOR_SUPPRESSED, HCURSOR};
 
 #[derive(Default)]
 pub struct CursorTracker {
@@ -71,6 +71,13 @@ pub fn os_pointer(rect: &DisplayRect) -> Option<(i32, i32, bool)> {
     let inside = x >= 0 && y >= 0 && x < rect.width as i32 && y < rect.height as i32;
     let showing = ci.flags.0 & CURSOR_SHOWING.0 != 0 && ci.flags.0 & CURSOR_SUPPRESSED.0 == 0 && !ci.hCursor.is_invalid();
     Some((x, y, showing && inside))
+}
+
+/// The current cursor handle (`None` when there is none or Windows won't say).
+pub fn os_cursor_handle() -> Option<HCURSOR> {
+    let mut ci = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+    unsafe { GetCursorInfo(&mut ci) }.ok()?;
+    (!ci.hCursor.is_invalid()).then_some(ci.hCursor)
 }
 
 /// Opaque pixels of a straight-alpha RGBA image (a cursor with none is invisible).
