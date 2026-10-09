@@ -91,8 +91,10 @@ pub struct Abr {
     min_rtt: Option<Duration>,
     min_rtt_at: Instant,
     prev: Option<Sample>,
-    /// Smoothed send rate (kbit/s).
+    /// Smoothed send rate (kbit/s) while video was queued, i.e. what the path
+    /// carries; a still picture (little to send) says nothing about that.
     rate_kbps: f64,
+    rate_at: Instant,
     bad_streak: u32,
     last_bad: Instant,
     last_decrease: Instant,
@@ -109,6 +111,8 @@ const CLEAR_BEFORE_INCREASE: Duration = Duration::from_millis(1500);
 const INCREASE_GAP: Duration = Duration::from_millis(500);
 const INCREASE: f64 = 1.2;
 const MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
+/// A send-rate measurement older than this is not used.
+const RATE_FRESH: Duration = Duration::from_secs(2);
 
 impl Abr {
     /// `None` for the fixed policy.
@@ -129,6 +133,7 @@ impl Abr {
             min_rtt_at: now,
             prev: None,
             rate_kbps: 0.0,
+            rate_at: now,
             bad_streak: 0,
             last_bad: now - Duration::from_secs(60),
             last_decrease: now - Duration::from_secs(60),
@@ -153,9 +158,11 @@ impl Abr {
         let prev = self.prev.replace(*s);
         if let Some(prev) = prev {
             let dt = (s.now - prev.now).as_secs_f64();
-            if dt > 0.0 {
+            if dt > 0.0 && (prev.backlog_bytes > 0 || s.backlog_bytes > 0) {
                 let kbps = s.sent_bytes.saturating_sub(prev.sent_bytes) as f64 * 8.0 / 1000.0 / dt;
-                self.rate_kbps = if self.rate_kbps == 0.0 { kbps } else { self.rate_kbps * 0.7 + kbps * 0.3 };
+                let fresh = self.rate_kbps > 0.0 && s.now - self.rate_at < RATE_FRESH;
+                self.rate_kbps = if fresh { self.rate_kbps * 0.7 + kbps * 0.3 } else { kbps };
+                self.rate_at = s.now;
             }
         }
         let backlog_ms = s.backlog_bytes * 8 / self.target.max(1) as u64;
@@ -198,7 +205,11 @@ impl Abr {
                 self.last_bad = s.now;
                 if self.bad_streak >= self.p.sustained && s.now - self.last_decrease >= DECREASE_GAP {
                     // What the path actually carried, a little under; at most a 30 % step.
-                    let measured = if self.rate_kbps > 0.0 { self.rate_kbps * 0.9 } else { self.target as f64 * 0.85 };
+                    let measured = if self.rate_kbps > 0.0 && s.now - self.rate_at < RATE_FRESH {
+                        self.rate_kbps * 0.9
+                    } else {
+                        self.target as f64 * 0.85
+                    };
                     let next = measured.min(self.target as f64 * 0.95).max(self.target as f64 * 0.7);
                     self.target = (next as u32).clamp(self.min, self.max);
                     self.last_decrease = s.now;
@@ -327,6 +338,23 @@ mod tests {
             sim.step(&mut a, 7_000, 30, 0, 0);
         }
         assert_eq!(a.target(), 10_000);
+    }
+
+    #[test]
+    fn still_picture_does_not_lower_the_measured_rate() {
+        let mut sim = Sim::new();
+        let mut a = Abr::new(10_000, BitratePolicy::Balanced, sim.t0).unwrap();
+        // 10 s of a still picture: almost nothing to send, nothing queued.
+        for _ in 0..40 {
+            sim.step(&mut a, 200, 30, 0, 0);
+        }
+        // Then more than the path carries (9 Mbit/s): set from that, not from the idle rate.
+        let mut v = None;
+        for _ in 0..3 {
+            v = v.or(sim.step(&mut a, 9_000, 30, 0, 700_000));
+        }
+        let v = v.expect("reacts after 0.75 s");
+        assert!((8_000..=8_200).contains(&v), "about 0.9 × 9 Mbit/s, got {v}");
     }
 
     #[test]
