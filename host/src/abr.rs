@@ -15,6 +15,10 @@
 //! | balanced | backlog > 400 ms, queueing delay  | 0.75 s    | 35 %  |
 //! | smooth   | backlog > 200 ms, delay, loss     | 0.5 s     | 15 %  |
 //! | fixed    | nothing                           | –         | 100 % |
+//!
+//! Every change costs a keyframe (FFmpeg's NVENC restarts with an IDR frame),
+//! so changes are few and large: a cut is at least 10 %, recovery goes up
+//! ×1.4 at most every 2 s and straight to the maximum once within 10 % of it.
 
 use std::time::{Duration, Instant};
 
@@ -108,8 +112,10 @@ pub struct Abr {
 
 const DECREASE_GAP: Duration = Duration::from_secs(1);
 const CLEAR_BEFORE_INCREASE: Duration = Duration::from_millis(1500);
-const INCREASE_GAP: Duration = Duration::from_millis(500);
-const INCREASE: f64 = 1.2;
+const INCREASE_GAP: Duration = Duration::from_secs(2);
+const INCREASE: f64 = 1.4;
+/// Smallest cut, and how close to the maximum an increase goes all the way.
+const MIN_STEP: f64 = 0.1;
 const MIN_RTT_WINDOW: Duration = Duration::from_secs(30);
 /// A send-rate measurement older than this is not used.
 const RATE_FRESH: Duration = Duration::from_secs(2);
@@ -204,18 +210,22 @@ impl Abr {
                 self.bad_streak += 1;
                 self.last_bad = s.now;
                 if self.bad_streak >= self.p.sustained && s.now - self.last_decrease >= DECREASE_GAP {
-                    // What the path actually carried, a little under; at most a 30 % step.
+                    // What the path actually carried, a little under; a 10–30 % step.
                     let measured = if self.rate_kbps > 0.0 && s.now - self.rate_at < RATE_FRESH {
                         self.rate_kbps * 0.9
                     } else {
                         self.target as f64 * 0.85
                     };
-                    let next = measured.min(self.target as f64 * 0.95).max(self.target as f64 * 0.7);
-                    self.target = (next as u32).clamp(self.min, self.max);
+                    let next = measured.min(self.target as f64 * (1.0 - MIN_STEP)).max(self.target as f64 * 0.7);
+                    let next = (next as u32).clamp(self.min, self.max);
+                    // Already at the floor: no change, no keyframe.
+                    if next < self.target {
+                        self.target = next;
+                        self.note = format!("{why}，实际 {:.1} Mbps → 降到 {:.1} Mbps", self.rate_kbps / 1000.0, self.target as f64 / 1000.0);
+                        self.note_at = Some(s.now);
+                    }
                     self.last_decrease = s.now;
                     self.bad_streak = 0;
-                    self.note = format!("{why}，实际 {:.1} Mbps → 降到 {:.1} Mbps", self.rate_kbps / 1000.0, self.target as f64 / 1000.0);
-                    self.note_at = Some(s.now);
                 }
             }
             None => {
@@ -224,7 +234,8 @@ impl Abr {
                     && s.now - self.last_bad >= CLEAR_BEFORE_INCREASE
                     && s.now - self.last_increase >= INCREASE_GAP
                 {
-                    self.target = ((self.target as f64 * INCREASE) as u32).min(self.max);
+                    let next = self.target as f64 * INCREASE;
+                    self.target = if next >= self.max as f64 * (1.0 - MIN_STEP) { self.max } else { next as u32 };
                     self.last_increase = s.now;
                     self.note = format!("网络恢复 → 升到 {:.1} Mbps", self.target as f64 / 1000.0);
                     self.note_at = Some(s.now);
@@ -355,6 +366,41 @@ mod tests {
         }
         let v = v.expect("reacts after 0.75 s");
         assert!((8_000..=8_200).contains(&v), "about 0.9 × 9 Mbit/s, got {v}");
+    }
+
+    #[test]
+    fn few_large_changes_because_each_costs_a_keyframe() {
+        let mut sim = Sim::new();
+        let mut a = Abr::new(10_000, BitratePolicy::Smooth, sim.t0).unwrap();
+        let mut changes = Vec::new();
+        // 8 s of a path carrying 1 Mbit/s: down to the 15 % floor (30 % steps, 1 s apart).
+        for _ in 0..32 {
+            changes.extend(sim.step(&mut a, 1_000, 30, 0, 400_000));
+        }
+        assert_eq!(a.target(), 1_500);
+        let cuts = changes.len();
+        assert!(changes.windows(2).all(|w| w[1] as f64 <= w[0] as f64 * 0.9 || w[1] == 1_500), "{changes:?}");
+        // Clear: back to the maximum in a few steps (1.5 → 2.1 → 2.94 → 4.1 → 5.8 → 8.1 → 10).
+        for _ in 0..80 {
+            changes.extend(sim.step(&mut a, 1_500, 30, 0, 0));
+        }
+        assert_eq!(a.target(), 10_000);
+        assert!(changes.len() - cuts <= 6, "{changes:?}");
+        assert!(changes[cuts..].windows(2).all(|w| w[1] as f64 >= w[0] as f64 * 1.1), "{changes:?}");
+    }
+
+    #[test]
+    fn one_dip_costs_two_changes() {
+        let mut sim = Sim::new();
+        let mut a = Abr::new(10_000, BitratePolicy::Balanced, sim.t0).unwrap();
+        let mut changes = Vec::new();
+        for _ in 0..3 {
+            changes.extend(sim.step(&mut a, 8_000, 30, 0, 700_000));
+        }
+        for _ in 0..40 {
+            changes.extend(sim.step(&mut a, 7_000, 30, 0, 0));
+        }
+        assert_eq!(changes, vec![7_200, 10_000]);
     }
 
     #[test]

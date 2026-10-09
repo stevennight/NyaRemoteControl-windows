@@ -431,10 +431,11 @@ impl Pipeline {
     }
 
     /// Adaptive bitrate from the network side, capped at the stream's configured rate.
+    /// A change costs a keyframe on NVENC, so an unchanged rate is left alone.
     pub fn set_bitrate(&mut self, kbps: u32) {
         let max = self.started.config.as_ref().map(|c| c.bitrate_kbps).unwrap_or(kbps);
         let k = kbps.clamp(500, max.max(500));
-        if self.encoder.set_bitrate(k) {
+        if k != self.encoder.config().bitrate_kbps && self.encoder.set_bitrate(k) {
             tracing::info!("bitrate -> {k} kbps");
         }
     }
